@@ -1,0 +1,135 @@
+[
+  {
+    "id": "BOV-104",
+    "qr_code": "QR-MANTA-104",
+    "name": "Manabita",
+    "breed": "Gyr Lechero",
+    "purpose": "Leche",
+    "hacienda": "Hacienda El Encanto",
+    "location": "San Lorenzo, Manta",
+    "birth_date": "2020-04-15",
+    "weight_kg": 480.5,
+    "avg_milk_daily_liters": 20.0,
+    "current_status": "Saludable",
+    "vaccinations": [
+      {
+        "disease": "Fiebre Aftosa",
+        "date_administered": "2025-11-10",
+        "due_date": "2026-05-10",
+        "status": "Vencida",
+        "batch": "AGRO-AFT-2025"
+      },
+      {
+        "disease": "Brucelosis",
+        "date_administered": "2024-06-20",
+        "due_date": "2027-06-20",
+        "status": "Vigente",
+        "batch": "BRUC-V-99"
+      },
+      {
+        "disease": "Rabia Paresia",
+        "date_administered": "2025-08-12",
+        "due_date": "2026-08-12",
+        "status": "Vigente",
+        "batch": "RAB-EC-40"
+      }
+    ],
+    "health_history": [
+      {
+        "date": "2025-09-01",
+        "symptoms": "Ligera deshidratación por calor estival",
+        "diagnosis": "Estrés térmico leve",
+        "treatment": "Electrolitos en agua y descanso bajo sombra",
+        "vet_name": "Dr. Roberto Intriago"
+      }
+    ],
+    "recent_milk_logs": [
+      {"date": "2026-07-18", "liters": 20.5},
+      {"date": "2026-07-19", "liters": 19.8},
+      {"date": "2026-07-20", "liters": 20.2},
+      {"date": "2026-07-21", "liters": 19.9},
+      {"date": "2026-07-22", "liters": 15.5}
+    ]
+  },
+  {
+    "id": "BOV-208",
+    "qr_code": "QR-MANTA-208",
+    "name": "Don Pedro",
+    "breed": "Brahman Gris",
+    "purpose": "Carne",
+    "hacienda": "Rancho San Mateo",
+    "location": "San Mateo, Manta",
+    "birth_date": "2021-08-10",
+    "weight_kg": 650.0,
+    "avg_milk_daily_liters": 0.0,
+    "current_status": "Saludable",
+    "vaccinations": [
+      {
+        "disease": "Fiebre Aftosa",
+        "date_administered": "2026-01-15",
+        "due_date": "2026-07-15",
+        "status": "Vencida",
+        "batch": "AGRO-AFT-2026-1"
+      },
+      {
+        "disease": "Carbón Sintomático",
+        "date_administered": "2025-10-05",
+        "due_date": "2026-10-05",
+        "status": "Vigente",
+        "batch": "CARB-MAN-11"
+      }
+    ],
+    "health_history": [],
+    "recent_weight_logs": [
+      {"date": "2026-05-01", "weight_kg": 640.0},
+      {"date": "2026-06-01", "weight_kg": 648.0},
+      {"date": "2026-07-01", "weight_kg": 650.0},
+      {"date": "2026-07-22", "weight_kg": 635.0}
+    ]
+  },
+  {
+    "id": "BOV-312",
+    "qr_code": "QR-MANTA-312",
+    "name": "Reina de Marianita",
+    "breed": "Girolando",
+    "purpose": "Doble Propósito",
+    "hacienda": "Finca Santa Marianita",
+    "location": "Santa Marianita, Manta",
+    "birth_date": "2019-12-01",
+    "weight_kg": 520.0,
+    "avg_milk_daily_liters": 18.0,
+    "current_status": "Bajo Observación",
+    "vaccinations": [
+      {
+        "disease": "Fiebre Aftosa",
+        "date_administered": "2026-02-10",
+        "due_date": "2026-08-10",
+        "status": "Vigente",
+        "batch": "AGRO-AFT-2026-1"
+      },
+      {
+        "disease": "Brucelosis",
+        "date_administered": "2024-02-10",
+        "due_date": "2027-02-10",
+        "status": "Vigente",
+        "batch": "BRUC-V-99"
+      }
+    ],
+    "health_history": [
+      {
+        "date": "2026-06-15",
+        "symptoms": "Cojera leve en pata posterior derecha",
+        "diagnosis": "Pododermatitis leve",
+        "treatment": "Limpieza podal y pediluvio con sulfato de cobre",
+        "vet_name": "Dra. María Moreira"
+      }
+    ],
+    "recent_milk_logs": [
+      {"date": "2026-07-18", "liters": 18.2},
+      {"date": "2026-07-19", "liters": 18.0},
+      {"date": "2026-07-20", "liters": 17.8},
+      {"date": "2026-07-21", "liters": 17.9},
+      {"date": "2026-07-22", "liters": 12.0}
+    ]
+  }
+]
