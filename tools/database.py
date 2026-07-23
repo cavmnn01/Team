@@ -8,6 +8,10 @@ from typing import Dict, Any, List, Optional
 DB_FILE = os.environ.get("DB_PATH", "bovino_manta.db")
 SAMPLE_DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "sample_data", "expediente_bovino.json")
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
 def get_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -123,19 +127,29 @@ def init_db():
         username TEXT PRIMARY KEY,
         full_name TEXT,
         role TEXT,
-        hacienda TEXT
+        hacienda TEXT,
+        password_hash TEXT
     )
     """)
+
+    # Migración: agregar columna password_hash si existe una tabla users antigua
+    cursor.execute("PRAGMA table_info(users)")
+    user_columns = [row[1] for row in cursor.fetchall()]
+    if "password_hash" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hash_password("Vaquero2026!"), "vaquero_sanlorenzo"))
+        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hash_password("VetManabi2026!"), "vet_manabi"))
+        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hash_password("AdminManta2026!"), "admin_manta"))
 
     # Usuarios por defecto
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.executemany("""
-        INSERT INTO users (username, full_name, role, hacienda) VALUES (?, ?, ?, ?)
+        INSERT INTO users (username, full_name, role, hacienda, password_hash) VALUES (?, ?, ?, ?, ?)
         """, [
-            ("vaquero_sanlorenzo", "Juan Carlos Delgado", "Vaquero", "Hacienda El Encanto"),
-            ("vet_manabi", "Dr. Roberto Intriago", "Veterinario", "Red Ganadera Manta"),
-            ("admin_manta", "Ing. Carmen Pinchao", "Administrador", "Asociación Ganaderos Manabí")
+            ("vaquero_sanlorenzo", "Juan Carlos Delgado", "Vaquero", "Hacienda El Encanto", hash_password("Vaquero2026!")),
+            ("vet_manabi", "Dr. Roberto Intriago", "Veterinario", "Red Ganadera Manta", hash_password("VetManabi2026!")),
+            ("admin_manta", "admincca", "Administrador", "Asociación Ganaderos Manabí", hash_password("AdminManta2026!"))
         ])
 
     # Perímetro por defecto para Hacienda El Encanto (San Lorenzo, Manta)
@@ -242,6 +256,169 @@ def get_all_animals() -> List[Dict[str, Any]]:
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_all_users() -> List[Dict[str, str]]:
+    """Devuelve la lista de usuarios registrados con sus roles."""
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, full_name, role, hacienda FROM users ORDER BY role ASC, username ASC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
+    """Valida credenciales de un usuario registrado."""
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    username_norm = username.strip().lower()
+    password_hash = hash_password(password)
+    cursor.execute("SELECT username, full_name, role, hacienda FROM users WHERE username = ? AND password_hash = ?", (username_norm, password_hash))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def register_user(username: str, full_name: str, password: str, role: str = "Vaquero", hacienda: str = "Hacienda El Encanto") -> Dict[str, str]:
+    """Registra un usuario nuevo con contraseña segura."""
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    username_norm = username.strip().lower()
+    password_hash = hash_password(password)
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username_norm,))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError("El usuario ya existe.")
+    cursor.execute(
+        "INSERT INTO users (username, full_name, role, hacienda, password_hash) VALUES (?, ?, ?, ?, ?)",
+        (username_norm, full_name.strip(), role.strip(), hacienda.strip(), password_hash)
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "username": username_norm,
+        "full_name": full_name.strip(),
+        "role": role.strip(),
+        "hacienda": hacienda.strip()
+    }
+
+
+def add_user(username: str, full_name: str, role: str, hacienda: str) -> Dict[str, str]:
+    """Crea un usuario nuevo o actualiza su rol y hacienda."""
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    username_norm = username.strip().lower()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username_norm,))
+    if cursor.fetchone():
+        cursor.execute(
+            "UPDATE users SET full_name = ?, role = ?, hacienda = ? WHERE username = ?",
+            (full_name.strip(), role.strip(), hacienda.strip(), username_norm)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO users (username, full_name, role, hacienda) VALUES (?, ?, ?, ?)",
+            (username_norm, full_name.strip(), role.strip(), hacienda.strip())
+        )
+    conn.commit()
+    conn.close()
+    return {
+        "username": username_norm,
+        "full_name": full_name.strip(),
+        "role": role.strip(),
+        "hacienda": hacienda.strip()
+    }
+
+
+def delete_user(username: str) -> bool:
+    """Elimina un usuario por nombre de usuario."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE username = ?", (username.strip().lower(),))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def add_animal(
+    animal_id: str,
+    qr_code: str,
+    name: str,
+    breed: str,
+    purpose: str,
+    hacienda: str,
+    location: str,
+    latitude: float,
+    longitude: float,
+    birth_date: str,
+    weight_kg: float,
+    avg_milk_daily_liters: float,
+    current_status: str = "Saludable"
+) -> Dict[str, Any]:
+    """Agrega un nuevo bovino al registro usando su código QR/Arete."""
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    animal_id_norm = animal_id.strip().upper()
+    qr_code_norm = qr_code.strip().upper()
+    cursor.execute("SELECT * FROM animals WHERE id = ? OR qr_code = ?", (animal_id_norm, qr_code_norm))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError("Ya existe un animal con ese ID o código QR.")
+    cursor.execute(
+        "INSERT INTO animals (id, qr_code, name, breed, purpose, hacienda, location, latitude, longitude, birth_date, weight_kg, avg_milk_daily_liters, current_status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            animal_id_norm,
+            qr_code_norm,
+            name.strip(),
+            breed.strip(),
+            purpose.strip(),
+            hacienda.strip(),
+            location.strip(),
+            latitude,
+            longitude,
+            birth_date.strip(),
+            weight_kg,
+            avg_milk_daily_liters,
+            current_status.strip(),
+            datetime.now().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "id": animal_id_norm,
+        "qr_code": qr_code_norm,
+        "name": name.strip(),
+        "breed": breed.strip(),
+        "purpose": purpose.strip(),
+        "hacienda": hacienda.strip(),
+        "location": location.strip(),
+        "latitude": latitude,
+        "longitude": longitude,
+        "birth_date": birth_date.strip(),
+        "weight_kg": weight_kg,
+        "avg_milk_daily_liters": avg_milk_daily_liters,
+        "current_status": current_status.strip()
+    }
+
+
+def delete_animal(query: str) -> bool:
+    """Elimina un bovino por ID o código QR."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    normalized = query.strip().upper()
+    cursor.execute("DELETE FROM animals WHERE id = ? OR qr_code = ?", (normalized, normalized))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
 
 def get_farm_perimeter(hacienda: str = "Hacienda El Encanto") -> List[Dict[str, float]]:
     """Recupera los puntos GPS del cerco/perímetro del recinto."""
