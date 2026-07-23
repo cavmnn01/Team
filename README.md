@@ -7,7 +7,7 @@
 
 ## 📋 Resumen del Proyecto
 
-**BovinoAI Manta** es una plataforma integral basada en sistemas multiagente de Inteligencia Artificial que automatiza la ingesta de novedades de campo, el pre-diagnóstico veterinario, la detección de mermas productivas ($\ge 15\%$) y la auditoría digital inmutable (cadena SHA-256) para haciendas ganaderas en Manta (San Lorenzo, Santa Marianita, San Mateo) y Manabí.
+**Bovi Manta** es una plataforma integral basada en sistemas multiagente de Inteligencia Artificial que automatiza la ingesta de novedades de campo, el pre-diagnóstico veterinario, la detección de mermas productivas ($\ge 15\%$) y la auditoría digital inmutable (cadena SHA-256) para haciendas ganaderas en Manta (San Lorenzo, Santa Marianita, San Mateo) y Manabí.
 
 ---
 

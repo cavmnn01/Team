@@ -11,7 +11,7 @@ from tools.database import init_db
 
 def main():
     print("=" * 70)
-    print("BOVINOAI MANTA: SISTEMA MULTIAGENTE DE TRAZABILIDAD GANADERA")
+    print("BOVI MANTA: SISTEMA MULTIAGENTE DE TRAZABILIDAD GANADERA")
     print("Zona: Manta, San Lorenzo, Santa Marianita, San Mateo (Manabí - Ecuador)")
     print("Alineado con ODS 8 (Trabajo Decente) y ODS 9 (Innovación e Infraestructura)")
     print("=" * 70)
