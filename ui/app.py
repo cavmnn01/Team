@@ -1,794 +1,1019 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import os
-import sys
-import json
+import os, sys, json, base64, urllib.parse
 from datetime import datetime
 import folium
-from folium.plugins import Draw, MarkerCluster
+from folium.plugins import Draw
 from streamlit_folium import st_folium
+from dotenv import load_dotenv
 
-# Añadir directorio raíz al PATH
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+load_dotenv(override=True)
 
-from tools.database import (
-    init_db, get_all_animals, get_ledger_records, get_animal_by_id_or_qr,
-    get_farm_perimeter, update_farm_perimeter, update_animal_gps
-)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import importlib.util
+for mod in ["tools", "tools.database"]:
+    if mod in sys.modules:
+        del sys.modules[mod]
+
+spec = importlib.util.spec_from_file_location(
+    "tools.database", os.path.join(project_root, "tools", "database.py"))
+db = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(db)
+sys.modules["tools.database"] = db
+
 from agents.orchestrator import BovinoOrchestrator
-
-# Inicializar DB y Orquestador
-init_db()
+db.init_db()
 orchestrator = BovinoOrchestrator()
 
-# Configuración de página
-st.set_page_config(
-    page_title="BovinoAI Manta - GPS Interactivo & Cerco",
-    page_icon="🐄",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ── Clerk configuration ──────────────────────────────────────────────────────
+CLERK_PUB_KEY = (
+    os.getenv("CLERK_PUBLISHABLE_KEY")
+    or os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY") or "pk_test_c3RpcnJlZC1zbmFrZS0zNy5jbGVyay5hY2NvdW50cy5kZXYk")
 
-# ESTILOS CSS MIDNIGHT SLATE DARK MODE
+def _get_frontend_api(pk: str) -> str:
+    try:
+        encoded = pk.split("_", 2)[-1]
+        pad = 4 - len(encoded) % 4
+        if pad != 4:
+            encoded += "=" * pad
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        return decoded.split("$")[0]
+    except Exception:
+        return "stirred-snake-37.clerk.accounts.dev"
+
+CLERK_FRONTEND_API = os.getenv("CLERK_FRONTEND_API", _get_frontend_api(CLERK_PUB_KEY)).replace("https://", "").replace("http://", "")
+CLERK_CONFIGURED = bool(os.getenv("CLERK_PUBLISHABLE_KEY") or os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"))
+
+def get_clerk_google_oauth_url():
+    import urllib.request, urllib.parse, json
+    fapi = CLERK_FRONTEND_API
+    pk = CLERK_PUB_KEY
+    url = f"https://{fapi}/v1/client/sign_ins?_clerk_js_version=5.0.0"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Bearer {pk}"
+    }
+    data = urllib.parse.urlencode({
+        "strategy": "oauth_google",
+        "redirect_url": "http://localhost:8501",
+        "action_complete_redirect_url": "http://localhost:8501"
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        res = urllib.request.urlopen(req)
+        body = json.loads(res.read().decode("utf-8"))
+        return body.get("response", {}).get("first_factor_verification", {}).get("external_verification_redirect_url")
+    except Exception as e:
+        return f"https://{fapi}/v1/oauth/google?redirect_url=http://localhost:8501"
+
+# ── Session state ─────────────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user = None
+    st.session_state.auth_message = ""
+    st.session_state.active_menu = "Dashboard"
+    st.session_state.selected_hacienda = "Hacienda El Encanto"
+    st.session_state.clerk_user = None
+    st.session_state.chat_history = [{
+        "role": "assistant",
+        "content": (
+            "Hola! Soy **BovinoAI**, tu asistente veterinario inteligente 24/7. "
+            "Menciona el ID del bovino y los sintomas para un diagnostico inmediato."
+        )
+    }]
+
+st.set_page_config(
+    page_title="BovinoAI Manta - Sanidad Bovina IA",
+    page_icon="🐄", layout="wide", initial_sidebar_state="expanded")
+
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Outfit:wght@400;600;700;800&display=swap');
+html,body,[class*="css"]{font-family:'Plus Jakarta Sans',system-ui,sans-serif!important;color:#0f2942!important;background:#eaf4f8!important;}
+.stApp{background:#eaf4f8!important;}
+header[data-testid="stHeader"]{background:transparent!important;}
+.stDeployButton,[data-testid="stToolbar"],[data-testid="manage-app-button"],footer{display:none!important;}
 
-    html, body, [class*="css"] {
-        font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif !important;
-        color: #f8fafc !important;
+/* Force sidebar to always stay visible on desktop when authenticated */
+@media (min-width: 768px) {
+    html:not(:has(.f-login)) [data-testid="stSidebar"] {
+        display: flex !important;
+        transform: none !important;
+        margin-left: 0 !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        width: 18rem !important;
+        min-width: 18rem !important;
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        bottom: 0 !important;
+        z-index: 99 !important;
     }
+    html:not(:has(.f-login)) .stMainBlockContainer,
+    html:not(:has(.f-login)) .block-container {
+        margin-left: 18rem !important;
+        max-width: calc(100% - 18rem) !important;
+        padding-top: 20px !important;
+        padding-bottom: 20px !important;
+    }
+}
 
-    .stApp {
-        background: radial-gradient(circle at 50% 0%, #1e293b 0%, #0f172a 60%, #0b0f19 100%) !important;
-    }
-
-    header[data-testid="stHeader"] {
-        background-color: rgba(15, 23, 42, 0.8) !important;
-        backdrop-filter: blur(20px) !important;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px !important;
-        background-color: rgba(30, 41, 59, 0.7) !important;
-        padding: 6px !important;
-        border-radius: 16px !important;
-        border: 1px solid rgba(255, 255, 255, 0.08) !important;
-    }
-
-    button[role="tab"], 
-    .stTabs [data-baseweb="tab"] {
-        background-color: transparent !important;
-        border-radius: 12px !important;
-        padding: 8px 20px !important;
-        border: none !important;
-        transition: all 0.2s ease !important;
-    }
-
-    button[role="tab"] *, 
-    .stTabs [data-baseweb="tab"] * {
-        color: #94a3b8 !important;
-        font-weight: 600 !important;
-        font-size: 0.92rem !important;
-    }
-
-    button[role="tab"]:hover *, 
-    .stTabs [data-baseweb="tab"]:hover * {
-        color: #f8fafc !important;
-    }
-
-    button[role="tab"][aria-selected="true"], 
-    .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        background-color: #334155 !important;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3) !important;
-    }
-
-    button[role="tab"][aria-selected="true"] *, 
-    .stTabs [data-baseweb="tab"][aria-selected="true"] * {
-        color: #38bdf8 !important;
-        font-weight: 800 !important;
-    }
-
-    .midnight-card {
-        background: rgba(30, 41, 59, 0.75);
-        backdrop-filter: blur(16px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 22px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-    }
-
-    .midnight-agent-card {
-        background: rgba(30, 41, 59, 0.85);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 20px;
-        padding: 24px;
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
-        height: 100%;
-    }
-
-    .pill-cyan {
-        background: rgba(56, 189, 248, 0.15);
-        color: #38bdf8;
-        border: 1px solid rgba(56, 189, 248, 0.3);
-        padding: 4px 12px;
-        border-radius: 9999px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        display: inline-block;
-    }
-
-    .pill-emerald {
-        background: rgba(16, 185, 129, 0.15);
-        color: #34d399;
-        border: 1px solid rgba(16, 185, 129, 0.3);
-        padding: 4px 12px;
-        border-radius: 9999px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        display: inline-block;
-    }
-
-    .pill-amber {
-        background: rgba(245, 158, 11, 0.15);
-        color: #fbbf24;
-        border: 1px solid rgba(245, 158, 11, 0.3);
-        padding: 4px 12px;
-        border-radius: 9999px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        display: inline-block;
-    }
-
-    .pill-rose {
-        background: rgba(244, 63, 94, 0.15);
-        color: #fb7185;
-        border: 1px solid rgba(244, 63, 94, 0.3);
-        padding: 4px 12px;
-        border-radius: 9999px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        display: inline-block;
-    }
-
-    .pill-purple {
-        background: rgba(192, 132, 252, 0.15);
-        color: #c084fc;
-        border: 1px solid rgba(192, 132, 252, 0.3);
-        padding: 4px 12px;
-        border-radius: 9999px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        display: inline-block;
-    }
-
-    [data-testid="stSidebar"] {
-        background-color: rgba(15, 23, 42, 0.95) !important;
-        border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
-    }
-
-    [data-testid="stSidebar"] * {
-        color: #f8fafc !important;
-    }
-
-    div[data-baseweb="select"], 
-    div[data-baseweb="select"] *, 
-    div[role="combobox"], 
-    div[role="button"] {
-        background-color: #1e293b !important;
-        color: #f8fafc !important;
-    }
-
-    div[data-baseweb="select"] > div {
-        background-color: #1e293b !important;
-        border: 1px solid #475569 !important;
-        border-radius: 12px !important;
-    }
-
-    .stTextArea textarea, .stTextInput input, .stNumberInput input {
-        background-color: #1e293b !important;
-        color: #f8fafc !important;
-        border: 1px solid #475569 !important;
-        border-radius: 14px !important;
-        font-size: 0.95rem !important;
-    }
-
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%) !important;
-        color: #ffffff !important;
-        border: none !important;
-        border-radius: 9999px !important;
-        font-weight: 800 !important;
-        font-size: 1rem !important;
-        padding: 12px 28px !important;
-        box-shadow: 0 4px 16px rgba(2, 132, 199, 0.35) !important;
-    }
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#07253a 0%,#051b2b 100%)!important;border-right:1px solid rgba(255,255,255,0.06)!important;}
+[data-testid="stSidebar"] *{color:#e2e8f0!important;}
+[data-testid="stSidebarContent"]{padding:0!important;}
+.stSidebar .stButton>button{width:100%!important;background:transparent!important;color:#94a3b8!important;border:none!important;border-radius:10px!important;text-align:left!important;padding:9px 14px!important;font-weight:600!important;font-size:0.88rem!important;margin-bottom:2px!important;transition:all 0.15s!important;}
+.stSidebar .stButton>button:hover{background:rgba(255,255,255,0.07)!important;color:#e2e8f0!important;}
+.stSidebar .stButton>button[kind="primary"]{background:linear-gradient(135deg,#0284c7,#0369a1)!important;color:#fff!important;font-weight:700!important;box-shadow:0 4px 14px rgba(2,132,199,0.35)!important;}
+.stButton>button[kind="primary"]{background:linear-gradient(135deg,#0284c7,#0369a1)!important;color:#fff!important;border:none!important;border-radius:12px!important;font-weight:700!important;padding:10px 22px!important;box-shadow:0 4px 14px rgba(2,132,199,0.3)!important;transition:all 0.2s!important;}
+.stButton>button[kind="primary"]:hover{transform:translateY(-1px)!important;box-shadow:0 8px 22px rgba(2,132,199,0.45)!important;}
+.stTextArea textarea,.stTextInput input{background:#f8fafc!important;border:1.5px solid #e0ecf7!important;border-radius:12px!important;color:#0f2942!important;font-size:0.95rem!important;}
+.stTabs [data-baseweb="tab-list"]{background:rgba(2,132,199,0.07)!important;border-radius:14px!important;padding:4px!important;gap:4px!important;border:1px solid rgba(2,132,199,0.13)!important;}
+.stTabs [data-baseweb="tab"]{border-radius:10px!important;font-weight:700!important;color:#64748b!important;border:none!important;}
+.stTabs [aria-selected="true"]{background:linear-gradient(135deg,#0284c7,#0369a1)!important;color:#fff!important;}
+[data-testid="stPopover"]>div>button{background:#fff!important;border:1.5px solid #dbeafe!important;border-radius:12px!important;padding:0 12px!important;height:38px!important;font-size:1.05rem!important;color:#0f2942!important;box-shadow:0 2px 8px rgba(7,37,58,0.04)!important;transition:all 0.15s!important;white-space:nowrap!important;}
+[data-testid="stPopover"]>div>button:hover{background:#f0f9ff!important;border-color:#7dd3fc!important;box-shadow:0 4px 14px rgba(2,132,199,0.14)!important;}
 </style>
 """, unsafe_allow_html=True)
 
-# Encabezado Principal Midnight
-col_head1, col_head2 = st.columns([3, 1])
 
-with col_head1:
-    st.markdown("<h1 style='color:#f8fafc; font-size: 2.4rem; font-weight: 800; margin-bottom: 2px;'>🐄 BovinoAI Manta</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color:#94a3b8; font-size: 0.98rem; margin-top: 0;'>Sistema Multiagente de IA para Diagnóstico, Control Sanitario & Trazabilidad | <b>Manta (San Lorenzo, Santa Marianita, San Mateo)</b></p>", unsafe_allow_html=True)
+def try_login(usr, pwd):
+    user = db.authenticate_user(usr, pwd)
+    if user:
+        st.session_state.authenticated = True
+        st.session_state.user = user
+        st.session_state.auth_message = ""
+        return True
+    st.session_state.auth_message = "❌ Usuario o contraseña incorrectos."
+    return False
 
-with col_head2:
-    st.markdown("""
-    <div style='text-align: right; padding-top: 8px;'>
-        <span class='pill-emerald'>🌿 ODS 8: Trabajo Decente</span>
-        <span class='pill-cyan' style='margin-left: 6px;'>⚡ ODS 9: Innovación</span>
-    </div>
-    """, unsafe_allow_html=True)
 
-st.markdown("<div style='margin-bottom: 12px;'></div>", unsafe_allow_html=True)
+def try_register(usr, name, pwd, hacienda):
+    if not usr or not name or not pwd:
+        st.session_state.auth_message = "❌ Completa todos los campos obligatorios."
+        return False
+    try:
+        db.register_user(usr, name, pwd, role="Vaquero", hacienda=hacienda)
+        st.session_state.auth_message = "✅ Cuenta registrada. Inicia sesión."
+        return True
+    except Exception as exc:
+        st.session_state.auth_message = f"❌ {exc}"
+        return False
 
-# Sidebar
-st.sidebar.markdown("### 🌿 BovinoAI Manta")
-st.sidebar.markdown("<p style='color:#94a3b8; font-size:0.85rem; margin-top:-10px;'>Gestión Ganadera Inteligente</p>", unsafe_allow_html=True)
 
-user_role = st.sidebar.selectbox(
-    "👤 Usuario Activo (RBAC):",
-    ["vaquero_sanlorenzo (Juan Carlos Delgado - Vaquero)",
-     "vet_manabi (Dr. Roberto Intriago - Veterinario)",
-     "admin_manta (Ing. Carmen Pinchao - Administrador)"]
-)
-username = user_role.split(" ")[0]
+# ── Clerk OAuth / Local callback ──────────────────────────────────────────────
+if not st.session_state.authenticated:
+    params = st.query_params
+    if "clerk_auth" in params or "created_by" in params or "created_at" in params:
+        try:
+            uname = params.get("username", "google_user")
+            fname = params.get("full_name", "Usuario Google")
+            user_row = db.get_user_role(uname) or {
+                "username": uname, "full_name": fname,
+                "role": "Vaquero", "hacienda": "Hacienda El Encanto"}
+            st.session_state.authenticated = True
+            st.session_state.user = user_row
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error procesando autenticación con Google: {e}")
 
-st.sidebar.divider()
-animals_list = get_all_animals()
-st.sidebar.markdown(f"**Bovinos Registrados:** <span class='pill-cyan'>{len(animals_list)} cabezas</span>", unsafe_allow_html=True)
-st.sidebar.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-st.sidebar.markdown("**Haciendas Cobertura:** <span class='pill-cyan'>San Lorenzo, Santa Marianita, San Mateo</span>", unsafe_allow_html=True)
-
-ledger_records = get_ledger_records()
-pending_tickets = [r for r in ledger_records if r.get("hitl_status") == "PENDIENTE"]
-if pending_tickets:
-    st.sidebar.markdown(f"<div class='pill-amber' style='margin-top: 14px; width: 100%; text-align: center;'>⚠️ {len(pending_tickets)} Ticket(s) HITL Pendientes</div>", unsafe_allow_html=True)
-
-st.sidebar.divider()
-st.sidebar.markdown("🟢 **Estado Base de Datos:** <span class='pill-emerald'>SQLite Activa</span>", unsafe_allow_html=True)
-st.sidebar.markdown("<div style='margin-top:6px;'></div>", unsafe_allow_html=True)
-st.sidebar.markdown("🔒 **Seguridad Ledger:** <span class='pill-cyan'>SHA-256 Validado</span>", unsafe_allow_html=True)
-
-# Pestañas Principales
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📱 Ingesta de Campo",
-    "🤖 Agentes IA",
-    "🩺 Supervisión (HITL)",
-    "🗺️ Mapa GPS & Cerco Interactivo",
-    "🔒 Bitácora Ledger",
-    "📊 Rendimiento",
-    "🌐 Impacto ODS"
-])
-
-# ---------------------------------------------------------
-# TAB 1: INGESTA DE CAMPO
-# ---------------------------------------------------------
-with tab1:
-    st.markdown("""
-    <div class='midnight-card'>
-        <h3 style='margin-top:0; color:#f8fafc; font-weight:800;'>📋 Registro Rápido de Novedades de Campo</h3>
-        <p style='color:#cbd5e1; font-size:0.92rem; margin-bottom:0;'>
-            El vaquero o técnico selecciona el Arete/QR e ingresa la novedad en lenguaje natural (dictado o escrito). La IA analizará los síntomas y caídas de leche.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_inp1, col_inp2 = st.columns([1, 2], gap="large")
-
-    with col_inp1:
-        st.markdown("##### 1. Identificación del Bovino")
-        animal_options = [f"{a['id']} - {a['name']} ({a['breed']} / {a['hacienda']})" for a in animals_list]
-        selected_animal_str = st.selectbox("Seleccionar Código Arete / QR:", animal_options)
-        selected_animal_id = selected_animal_str.split(" - ")[0]
-
-        profile_pre = get_animal_by_id_or_qr(selected_animal_id)
-        if profile_pre:
-            st.markdown(f"""
-            <div style='background-color:#1e293b; padding: 20px; border-radius: 16px; border: 1px solid #475569; color:#f8fafc;'>
-                <p style='margin: 4px 0; font-size:0.92rem;'><b>Nombre:</b> {profile_pre['name']}</p>
-                <p style='margin: 4px 0; font-size:0.92rem;'><b>Raza / Propósito:</b> {profile_pre['breed']} ({profile_pre['purpose']})</p>
-                <p style='margin: 4px 0; font-size:0.92rem;'><b>Ubicación:</b> {profile_pre['hacienda']} ({profile_pre['location']})</p>
-                <p style='margin: 4px 0; font-size:0.92rem;'><b>Promedio Leche:</b> {profile_pre['avg_milk_daily_liters']} L/día</p>
-                <p style='margin: 8px 0 0 0;'><b>Estado:</b> <span class='pill-emerald'>{profile_pre['current_status']}</span></p>
-            </div>
-            """, unsafe_allow_html=True)
-
-    with col_inp2:
-        st.markdown("##### 2. Novedad Registrada por Voz / Texto")
-        field_narrative = st.text_area(
-            "Dictado del vaquero en lenguaje natural:",
-            value="La vaca 104 comió muy poco el día de hoy, tiene la ubre muy caliente e hinchada y produjo 4.5 litros menos de leche.",
-            height=110
-        )
-
-        col_cam1, col_cam2 = st.columns([2, 1])
-        with col_cam1:
-            image_file = st.file_uploader("📷 Adjuntar foto de síntoma / inspección (Opcional):", type=["jpg", "png", "jpeg"])
-            img_desc = None
-            if image_file:
-                img_desc = f"Fotografía adjunta: Inspección visual de tejido bovino ({image_file.name})"
-        with col_cam2:
-            if image_file:
-                st.image(image_file, caption="Foto adjunta", width=140)
-
-        st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
-        submit_btn = st.button("✨ Procesar Con Red Multiagente", type="primary", use_container_width=True)
-
-    if submit_btn:
-        with st.spinner("🤖 Evaluando novedad con red multiagente..."):
-            result = orchestrator.process_field_report(
-                qr_or_id=selected_animal_id,
-                user_narrative=field_narrative,
-                username=username,
-                image_description=img_desc
-            )
-            st.session_state['latest_evaluation'] = result
-
-        if result["success"]:
-            st.toast("✅ Novedad procesada exitosamente", icon="🎉")
-            if result["requires_hitl_approval"]:
-                st.markdown(f"<div class='pill-rose' style='font-size:0.92rem; padding: 10px 18px; width: 100%; text-align: center; margin-top: 14px;'>🚨 Alerta Sanitaria Generada: Requiere aprobación del veterinario en 'Supervisión (HITL)' (Ticket #{result['hitl_ticket_id']})</div>", unsafe_allow_html=True)
-
-# ---------------------------------------------------------
-# TAB 2: AGENTES IA
-# ---------------------------------------------------------
-with tab2:
-    st.markdown("### 🤖 Arquitectura Multiagente OpenAI SDK")
-    st.markdown("<p style='color:#94a3b8; font-size:0.92rem;'>Visualización en tiempo real de la ejecución y salidas de cada agente especialista.</p>", unsafe_allow_html=True)
-
-    latest_eval = st.session_state.get('latest_evaluation')
-
-    if not latest_eval:
-        st.info("💡 Ingrese una novedad en 'Ingesta de Campo' para visualizar los datos generados por cada agente.")
-    else:
-        outputs = latest_eval["agent_outputs"]
-
-        col_a1, col_a2, col_a3, col_a4 = st.columns(4, gap="medium")
-
-        with col_a1:
-            ident = outputs["identifier"]
-            st.markdown(f"""
-            <div class='midnight-agent-card'>
-                <h4 style='color:#38bdf8; margin-top:0; font-size:1.05rem; font-weight:800;'>🔍 IdentifierAgent</h4>
-                <p style='color:#94a3b8; font-size:0.8rem; font-weight:700; margin-bottom:12px;'>Function Calling DB</p>
-                <hr style='border-color:rgba(255,255,255,0.08); margin:10px 0;'>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>ID Bovino:</b> <span class='pill-cyan'>{ident['animal_id']}</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Nombre:</b> {ident['animal_name']}</p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Hacienda:</b> {ident['hacienda']}</p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Rol Usuario:</b> <span class='pill-cyan'>{ident['user']['role']}</span></p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col_a2:
-            san = outputs["sanitary"]
-            st.markdown(f"""
-            <div class='midnight-agent-card'>
-                <h4 style='color:#c084fc; margin-top:0; font-size:1.05rem; font-weight:800;'>🩺 SanitaryAgent</h4>
-                <p style='color:#94a3b8; font-size:0.8rem; font-weight:700; margin-bottom:12px;'>Diagnóstico Clínico</p>
-                <hr style='border-color:rgba(255,255,255,0.08); margin:10px 0;'>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Pre-diagnóstico:</b> {san['pre_diagnosis']}</p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Confianza:</b> <span class='pill-purple'>{san['confidence_percent']}%</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Severidad:</b> <span class='pill-rose'>{san['severity']}</span></p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col_a3:
-            prod = outputs["productive"]
-            st.markdown(f"""
-            <div class='midnight-agent-card'>
-                <h4 style='color:#34d399; margin-top:0; font-size:1.05rem; font-weight:800;'>📊 ProductiveAgent</h4>
-                <p style='color:#94a3b8; font-size:0.8rem; font-weight:700; margin-bottom:12px;'>Structured Output</p>
-                <hr style='border-color:rgba(255,255,255,0.08); margin:10px 0;'>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Valor Actual:</b> <span class='pill-cyan'>{prod['current_value']} L</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Caída:</b> <span class='pill-rose'>{prod['drop_percentage']}%</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Pérdida/día:</b> <b>${prod['estimated_daily_financial_loss_usd']}</b></p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col_a4:
-            ledg = outputs["ledger"]
-            st.markdown(f"""
-            <div class='midnight-agent-card'>
-                <h4 style='color:#f8fafc; margin-top:0; font-size:1.05rem; font-weight:800;'>🔒 LedgerAgent</h4>
-                <p style='color:#94a3b8; font-size:0.8rem; font-weight:700; margin-bottom:12px;'>Firma SHA-256</p>
-                <hr style='border-color:rgba(255,255,255,0.08); margin:10px 0;'>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Ticket HITL:</b> <span class='pill-amber'>#{ledg['ledger_ticket_id']}</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Estado:</b> <span class='pill-amber'>{ledg['hitl_status']}</span></p>
-                <p style='margin:6px 0; font-size:0.88rem;'><b>Hash:</b> <span class='pill-cyan'>{ledg['hash_sha256'][:12]}...</span></p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("<div style='margin-top: 24px;'></div>", unsafe_allow_html=True)
-        with st.expander("📄 Ver estructura técnica en formato JSON (Opcional)"):
-            st.json(outputs)
-
-# ---------------------------------------------------------
-# TAB 3: SUPERVISIÓN HUMANA (HITL)
-# ---------------------------------------------------------
-with tab3:
-    st.markdown("### 🩺 Supervisión Médica Humana (*Human-In-The-Loop*)")
-    st.caption("Control Sanitario: Ningún tratamiento médico se aplica sin la firma explícita del profesional veterinario.")
-
-    all_ledger = get_ledger_records()
-    pending_records = [r for r in all_ledger if r.get("hitl_status") == "PENDIENTE"]
-
-    if not pending_records:
-        st.markdown("""
-        <div class='midnight-card' style='text-align: center; padding: 36px;'>
-            <h4 style='color: #34d399; margin: 0;'>✨ No hay tickets pendientes</h4>
-            <p style='color: #94a3b8; margin-top: 6px;'>Todas las evaluaciones sanitarias han sido supervisadas.</p>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"<div class='pill-amber' style='font-size: 0.9rem; padding: 8px 18px; margin-bottom: 16px;'>🚨 {len(pending_records)} Ticket(s) Pendientes de Firma Médica</div>", unsafe_allow_html=True)
-
-        for ticket in pending_records:
-            ticket_id = ticket["id"]
-            animal_id = ticket["animal_id"]
-            payload = ticket.get("payload", {})
-            sanitary = payload.get("sanitary", {})
-            productive = payload.get("productive", {})
-
-            with st.container():
-                st.markdown(f"""
-                <div class='midnight-card'>
-                    <div style='display: flex; justify-content: space-between; align-items: center;'>
-                        <h4 style='margin:0; color: #f8fafc;'>📋 Ticket HITL #{ticket_id} — Bovino {animal_id}</h4>
-                        <span class='pill-amber'>Pendiente Revisión</span>
-                    </div>
-                    <hr style='border-color: rgba(255,255,255,0.08); margin: 16px 0;'>
-                </div>
-                """, unsafe_allow_html=True)
-
-                col_t1, col_t2 = st.columns(2)
-
-                with col_t1:
-                    st.markdown(f"**Pre-diagnóstico IA:** {sanitary.get('pre_diagnosis')}")
-                    st.markdown(f"**Nivel de Confianza:** <span class='pill-cyan'>{sanitary.get('confidence_percent')}%</span>", unsafe_allow_html=True)
-                    st.markdown(f"**Síntomas:** *\"{sanitary.get('symptoms_reported')}\"*")
-                    st.markdown(f"**Tratamiento Sugerido:** {sanitary.get('recommended_treatment_plan')}")
-
-                with col_t2:
-                    st.markdown(f"**Caída Productiva:** <span class='pill-rose'>{productive.get('drop_percentage')}%</span>", unsafe_allow_html=True)
-                    st.markdown(f"**Pérdida Diaria Est.:** `${productive.get('estimated_daily_financial_loss_usd')}/día`")
-                    vac = sanitary.get("vaccination_status", {})
-                    if vac.get("has_expired_vaccines"):
-                        st.markdown("<span class='pill-rose'>Vacuna Aftosa Vencida</span>", unsafe_allow_html=True)
-                    else:
-                        st.markdown("<span class='pill-emerald'>Vacunas al día</span>", unsafe_allow_html=True)
-
-                comment_input = st.text_input(f"Prescripción / Observación Médica (Ticket #{ticket_id}):", value="Tratamiento validado. Aplicar infusión intramamaria y aislamiento por 48 horas.", key=f"comm_{ticket_id}")
-
-                col_b1, col_b2, col_b3 = st.columns(3)
-                with col_b1:
-                    if st.button("✅ [APROBAR TRATAMIENTO]", key=f"app_{ticket_id}", type="primary", use_container_width=True):
-                        orchestrator.resolve_hitl_ticket(
-                            ticket_id=ticket_id,
-                            decision="APROBADO",
-                            reviewer_name=f"{username} (Veterinario)",
-                            comment=comment_input
-                        )
-                        st.toast(f"Ticket #{ticket_id} APROBADO", icon="✅")
-                        st.rerun()
-
-                with col_b2:
-                    if st.button("✏️ [MODIFICAR DIAGNÓSTICO]", key=f"mod_{ticket_id}", use_container_width=True):
-                        orchestrator.resolve_hitl_ticket(
-                            ticket_id=ticket_id,
-                            decision="MODIFICADO",
-                            reviewer_name=f"{username} (Veterinario)",
-                            comment=comment_input
-                        )
-                        st.toast(f"Ticket #{ticket_id} MODIFICADO", icon="✏️")
-                        st.rerun()
-
-                with col_b3:
-                    if st.button("❌ [RECHAZAR ALERTA]", key=f"rej_{ticket_id}", use_container_width=True):
-                        orchestrator.resolve_hitl_ticket(
-                            ticket_id=ticket_id,
-                            decision="RECHAZADO",
-                            reviewer_name=f"{username} (Veterinario)",
-                            comment=comment_input
-                        )
-                        st.toast(f"Ticket #{ticket_id} RECHAZADO", icon="❌")
-                        st.rerun()
-
-# ---------------------------------------------------------
-# TAB 4: MAPA GPS INTERACTIVO (DIBUJO Y CLIC DIRECTO)
-# ---------------------------------------------------------
-with tab4:
-    st.markdown("### 🗺️ Mapa GPS Interactivo — Delimitación del Cerco & Bovinos")
-    st.markdown("""
-    <div class='midnight-card'>
-        <h4 style='margin-top:0; color:#f8fafc; font-weight:800;'>📍 Dibuje o Clickee en el Mapa para Delimitar su Recinto en Ecuador</h4>
-        <p style='color:#cbd5e1; font-size:0.92rem; margin-bottom:0;'>
-            • <b>Dibujo en Mapa:</b> Utilice las herramientas de dibujo en la esquina superior izquierda del mapa (Polígono / Marcadores).<br>
-            • <b>Clic Directo:</b> Haga clic en cualquier punto del mapa para capturar las coordenadas GPS e incorporarlas al perímetro del recinto.<br>
-            • <b>Bovinos en Vivo:</b> Los marcadores muestran a cada animal con su estado de salud y producción.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    haciendas = ["Hacienda El Encanto", "Rancho San Mateo", "Finca Santa Marianita"]
-    col_map_h, col_map_s = st.columns([2, 1])
-
-    with col_map_h:
-        sel_hacienda = st.selectbox("Seleccionar Recinto / Hacienda:", haciendas, key="sel_hac_map")
-
-    with col_map_s:
-        tile_style = st.selectbox("Estilo de Mapa Visual:", ["CartoDB dark_matter", "OpenStreetMap", "Esri WorldImagery (Satélite)"])
-
-    # Cargar coordenadas del cerco
-    polygon_pts = get_farm_perimeter(sel_hacienda)
-    if not polygon_pts:
-        polygon_pts = [
-            {"latitude": -1.055, "longitude": -80.905},
-            {"latitude": -1.052, "longitude": -80.892},
-            {"latitude": -1.062, "longitude": -80.888},
-            {"latitude": -1.065, "longitude": -80.901},
-            {"latitude": -1.055, "longitude": -80.905}
-        ]
-
-    center_lat = sum(p["latitude"] for p in polygon_pts) / len(polygon_pts) if polygon_pts else -1.058
-    center_lon = sum(p["longitude"] for p in polygon_pts) / len(polygon_pts) if polygon_pts else -80.897
-
-    # Crear mapa Folium interactivo
-    tile_attr = "Map tiles by CartoDB / Esri"
-    if tile_style == "Esri WorldImagery (Satélite)":
-        tiles_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-    elif tile_style == "CartoDB dark_matter":
-        tiles_url = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-    else:
-        tiles_url = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=14, tiles=tiles_url, attr=tile_attr)
-
-    # 1. Dibujar el polígono de perímetro actual de la hacienda
-    poly_coords = [[p["latitude"], p["longitude"]] for p in polygon_pts]
-    folium.Polygon(
-        locations=poly_coords,
-        color="#38bdf8",
-        weight=3,
-        fill=True,
-        fill_color="#0284c7",
-        fill_opacity=0.25,
-        popup=f"Cerco Delimitado: {sel_hacienda}",
-        tooltip=f"<b>Recinto:</b> {sel_hacienda}"
-    ).add_to(m)
-
-    # 2. Agregar marcadores de los bovinos
-    current_animals = get_all_animals()
-    for anim in current_animals:
-        status = anim.get("current_status", "Saludable")
-        icon_color = "green" if status == "Saludable" else "orange" if status == "Bajo Observación" else "red"
-
-        popup_html = f"""
-        <div style="font-family: sans-serif; font-size: 13px; color: #1e293b;">
-            <b style="color: #0284c7;">🐄 Bovino {anim['id']} ({anim['name']})</b><br>
-            <b>Raza:</b> {anim['breed']} ({anim['purpose']})<br>
-            <b>Hacienda:</b> {anim['hacienda']} ({anim['location']})<br>
-            <b>Estado:</b> <b style="color:{icon_color};">{anim['current_status']}</b><br>
-            <b>Leche:</b> {anim['avg_milk_daily_liters']} Litros/día<br>
-            <b>GPS:</b> Lat {anim.get('latitude', 0.0):.4f}, Lon {anim.get('longitude', 0.0):.4f}
-        </div>
-        """
-        folium.Marker(
-            location=[anim.get("latitude", -1.058), anim.get("longitude", -80.897)],
-            popup=folium.Popup(popup_html, max_width=250),
-            tooltip=f"<b>{anim['id']} ({anim['name']})</b> — {anim['current_status']}",
-            icon=folium.Icon(color=icon_color, icon="heart", prefix="fa")
-        ).add_to(m)
-
-    # 3. Herramienta de Dibujo Interactivo (Draw Plugin)
-    draw_plugin = Draw(
-        export=True,
-        filename=f"cerco_{sel_hacienda}.geojson",
-        position="topleft",
-        draw_options={
-            'polyline': True,
-            'polygon': True,
-            'rectangle': True,
-            'circle': False,
-            'marker': True,
-            'circlemarker': False
-        },
-        edit_options={'edit': True}
-    )
-    draw_plugin.add_to(m)
-
-    # Renderizar mapa interactivo con st_folium
-    st.markdown("##### 📍 Lienzo Interactivo — Dibuje Polígonos o Clickee en el Mapa")
-    st_data = st_folium(m, width="100%", height=550, key="folium_interactive_map")
-
-    # Captura de Eventos de Clic y Dibujo
-    col_act1, col_act2 = st.columns(2, gap="medium")
-
-    with col_act1:
-        st.markdown("##### 📍 Captura de Clic Directo en Mapa")
-        if st_data and st_data.get("last_clicked"):
-            click_lat = st_data["last_clicked"]["lat"]
-            click_lon = st_data["last_clicked"]["lng"]
-
-            st.markdown(f"""
-            <div style='background:#1e293b; padding:14px; border-radius:14px; border:1px solid #38bdf8;'>
-                <b>Punto Clickeado:</b> Lat <code>{click_lat:.6f}</code> | Lon <code>{click_lon:.6f}</code>
-            </div>
-            """, unsafe_allow_html=True)
-
-            if st.button("➕ Añadir Punto Clickeado al Cerco", type="primary", use_container_width=True):
-                updated_pts = polygon_pts.copy()
-                # Insertar antes del último punto de cierre
-                updated_pts.insert(-1, {"latitude": click_lat, "longitude": click_lon})
-                update_farm_perimeter(sel_hacienda, updated_pts)
-                st.toast(f"✅ Punto ({click_lat:.4f}, {click_lon:.4f}) añadido al cerco", icon="📍")
-                st.rerun()
-        else:
-            st.info("👆 Haga clic en cualquier punto del mapa para capturar sus coordenadas GPS y añadirlo al cerco.")
-
-    with col_act2:
-        st.markdown("##### ✏️ Captura de Polígono Dibujado en Pantalla")
-        all_drawings = st_data.get("all_drawings") if st_data else None
-        if all_drawings and len(all_drawings) > 0:
-            last_shape = all_drawings[-1]
-            geom_type = last_shape.get("geometry", {}).get("type")
-            coords_raw = last_shape.get("geometry", {}).get("coordinates", [])
-
-            st.markdown(f"**Figura Dibujada:** `<span class='pill-cyan'>{geom_type}</span>`", unsafe_allow_html=True)
-
-            if geom_type in ["Polygon", "MultiPolygon"] and coords_raw:
-                drawn_points = []
-                ring = coords_raw[0] if geom_type == "Polygon" else coords_raw[0][0]
-                for p in ring:
-                    drawn_points.append({"latitude": p[1], "longitude": p[0]})
-
-                if st.button("💾 Guardar Polígono Dibujado Como Nuevo Cerco", type="primary", use_container_width=True):
-                    update_farm_perimeter(sel_hacienda, drawn_points)
-                    st.toast("✅ Cerco actualizado con el dibujo del mapa", icon="🎨")
+    if "local_auth" in params:
+        try:
+            action = params.get("action")
+            username = params.get("username")
+            password = params.get("password")
+            if action == "local_login":
+                if try_login(username, password):
+                    st.query_params.clear()
                     st.rerun()
-        else:
-            st.info("🎨 Use el botón de pentágono/polígono (esquina superior izquierda del mapa) para trazar visualmente el recinto.")
+                else:
+                    st.query_params.clear()
+            elif action == "local_register":
+                full_name = params.get("full_name")
+                hacienda = params.get("hacienda", "Hacienda El Encanto")
+                ok = try_register(username, full_name, password, hacienda)
+                st.query_params.clear()
+                if ok:
+                    if try_login(username, password):
+                        st.rerun()
+        except Exception as e:
+            st.query_params.clear()
+            st.error(f"Error: {e}")
 
-    st.divider()
+# ── AUTH PAGE (PURE HTML/CSS FOR ST.MARKDOWN) ──────────
+if not st.session_state.authenticated:
+    google_oauth_url = get_clerk_google_oauth_url()
 
-    # Opción para reiniciar cerco a puntos por defecto
-    if st.button("🗑️ Reiniciar Perímetro a Coordenadas por Defecto"):
-        default_pts = [
-            {"latitude": -1.055, "longitude": -80.905},
-            {"latitude": -1.052, "longitude": -80.892},
-            {"latitude": -1.062, "longitude": -80.888},
-            {"latitude": -1.065, "longitude": -80.901},
-            {"latitude": -1.055, "longitude": -80.905}
-        ]
-        update_farm_perimeter(sel_hacienda, default_pts)
-        st.toast("Cerco reiniciado por defecto", icon="🔄")
+    auth_msg_display = ""
+    if st.session_state.auth_message:
+        msg_cls = "suc" if st.session_state.auth_message.startswith("✅") else "err"
+        auth_msg_display = f'<div id="msg" class="{msg_cls}">{st.session_state.auth_message}</div>'
+        st.session_state.auth_message = ""
+
+    auth_html = f"""
+<style>
+.auth-wrapper {{
+  display:flex; align-items:center; justify-content:center;
+  min-height: 100vh; width: 100%;
+  padding: 20px 16px;
+}}
+.card-container {{
+  width:100%; max-width:440px;
+  background:#ffffff; border-radius:28px; padding:36px 32px;
+  border:1.5px solid #dbeafe;
+  box-shadow:0 20px 50px rgba(7,37,58,0.07), 0 4px 14px rgba(2,132,199,0.04);
+  max-height: 95vh; overflow-y: auto;
+}}
+.card-container::-webkit-scrollbar {{ width: 6px; }}
+.card-container::-webkit-scrollbar-track {{ background: #f1f5f9; border-radius: 9999px; }}
+.card-container::-webkit-scrollbar-thumb {{ background: #bae6fd; border-radius: 9999px; }}
+
+.card-header{{text-align:center;margin-bottom:24px;}}
+.logo-box{{
+  width:60px;height:60px; background:linear-gradient(135deg,#0284c7,#0c4a6e);
+  border-radius:20px; display:inline-flex;align-items:center;justify-content:center;
+  font-size:32px; box-shadow:0 8px 22px rgba(2,132,199,0.35); margin-bottom:14px;
+}}
+.brand-title{{ font-family:'Outfit',sans-serif; font-size:1.85rem; font-weight:800; color:#07253a; line-height:1.1; }}
+.brand-sub{{ font-size:0.85rem; color:#64748b; font-weight:600; margin-top:5px; }}
+
+#msg{{padding:10px 14px;border-radius:12px;font-size:0.84rem;font-weight:600;margin-bottom:16px;}}
+#msg.err{{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;}}
+#msg.suc{{background:#dcfce7;color:#15803d;border:1px solid #86efac;}}
+
+.g-btn{{
+  width:100%;padding:13px 16px;background:#ffffff;border:1.5px solid #dbeafe;
+  border-radius:14px;display:flex;align-items:center;justify-content:center;gap:12px;
+  cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;font-size:0.95rem;font-weight:700;
+  color:#0f2942;transition:all 0.2s;margin-bottom:20px;
+  box-shadow:0 2px 8px rgba(7,37,58,0.03); text-decoration:none!important;
+}}
+.g-btn:hover{{ background:#f0f9ff;border-color:#7dd3fc; box-shadow:0 6px 18px rgba(2,132,199,0.15);transform:translateY(-1px); }}
+
+.divider{{display:flex;align-items:center;gap:12px;margin:18px 0;}}
+.divider::before,.divider::after{{content:'';flex:1;height:1px;background:#e0ecf7;}}
+.divider span{{font-size:0.8rem;color:#94a3b8;font-weight:600;white-space:nowrap;}}
+
+.tabs-ui {{
+  display:flex;gap:5px;margin-bottom:22px;background:rgba(2,132,199,0.06);
+  border-radius:14px;padding:4px;border:1px solid rgba(2,132,199,0.12);
+}}
+.tab-lbl {{
+  flex:1;padding:10px;border:none;border-radius:11px;cursor:pointer;
+  font-family:'Plus Jakarta Sans',sans-serif;font-size:0.9rem;font-weight:700;
+  color:#64748b;background:transparent;transition:all 0.2s; text-align: center;
+}}
+.form-container {{ display: none; }}
+
+/* PURE CSS TAB LOGIC */
+#tab-login:checked ~ .f-login {{ display: block; }}
+#tab-register:checked ~ .f-reg {{ display: block; }}
+
+#tab-login:checked ~ .tabs-ui .t-in {{
+  background:linear-gradient(135deg,#0284c7,#0369a1);color:#ffffff;
+  box-shadow:0 4px 14px rgba(2,132,199,0.32);
+}}
+#tab-register:checked ~ .tabs-ui .t-up {{
+  background:linear-gradient(135deg,#0284c7,#0369a1);color:#ffffff;
+  box-shadow:0 4px 14px rgba(2,132,199,0.32);
+}}
+
+.fld{{margin-bottom:16px;text-align:left;}}
+.fld label{{display:block;font-size:0.84rem;font-weight:700;color:#0f2942;margin-bottom:6px;}}
+.fld input{{
+  width:100%;padding:12px 15px;background:#f8fafc;border:1.5px solid #e0ecf7;
+  border-radius:13px;font-family:'Plus Jakarta Sans',sans-serif;font-size:0.94rem;color:#0f2942;
+  transition:all 0.15s;outline:none; box-sizing: border-box;
+}}
+.fld input:focus{{border-color:#0284c7;box-shadow:0 0 0 3px rgba(2,132,199,0.12);background:#ffffff;}}
+
+.sub{{
+  width:100%;padding:14px;background:linear-gradient(135deg,#0284c7,#0369a1);
+  border:none;border-radius:14px;color:#ffffff;font-family:'Plus Jakarta Sans',sans-serif;
+  font-size:0.98rem;font-weight:800;cursor:pointer;transition:all 0.2s;
+  box-shadow:0 4px 16px rgba(2,132,199,0.35);margin-top:8px;letter-spacing:0.3px;
+}}
+.sub:hover{{transform:translateY(-2px);box-shadow:0 8px 24px rgba(2,132,199,0.45);}}
+</style>
+
+<div class="auth-wrapper">
+<div class="card-container">
+  <div class="card-header">
+    <div class="logo-box">🐄</div>
+    <div class="brand-title">BovinoAI Manta</div>
+    <div class="brand-sub">Sanidad Ganadera & IA Multiagente</div>
+  </div>
+
+  {auth_msg_display}
+
+  <!-- Google OAuth Anchor Link -->
+  <a href="{google_oauth_url}" target="_self" class="g-btn">
+    <svg width="20" height="20" viewBox="0 0 48 48">
+      <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.2l6.8-6.8C35.7 2.1 30.2 0 24 0 14.8 0 6.9 5.5 3 13.5l7.9 6.1C12.8 13.5 17.9 9.5 24 9.5z"/>
+      <path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.2-.4-4.7H24v9h12.7c-.6 3-2.3 5.5-4.8 7.2l7.4 5.7c4.3-4 6.8-9.9 6.8-17.2z"/>
+      <path fill="#FBBC05" d="M10.9 28.4A14.4 14.4 0 0 1 9.5 24c0-1.5.3-3 .8-4.4L2.4 13.5A23.9 23.9 0 0 0 0 24c0 3.8.9 7.4 2.4 10.5l8.5-6.1z"/>
+      <path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.4-5.7c-2.1 1.4-4.7 2.2-7.8 2.2-6.1 0-11.2-4-13.1-9.5l-8.1 6.1C6.8 42.4 14.8 48 24 48z"/>
+    </svg>
+    <span>Continuar con Google</span>
+  </a>
+
+  <div class="divider"><span>o continúa con tu cuenta</span></div>
+
+  <!-- PURE CSS TABS -->
+  <input type="radio" id="tab-login" name="auth-tab" checked style="display:none;">
+  <input type="radio" id="tab-register" name="auth-tab" style="display:none;">
+
+  <div class="tabs-ui">
+    <label for="tab-login" class="tab-lbl t-in">🔒 Iniciar Sesión</label>
+    <label for="tab-register" class="tab-lbl t-up">📝 Crear Cuenta</label>
+  </div>
+
+  <!-- LOGIN FORM (Pure HTML, GET request) -->
+  <div class="f-login form-container">
+    <form action="" method="GET" target="_self">
+      <input type="hidden" name="action" value="local_login">
+      <input type="hidden" name="local_auth" value="1">
+      <div class="fld"><label>Usuario</label><input type="text" name="username" placeholder="tu_usuario" required autocomplete="username"></div>
+      <div class="fld"><label>Contraseña</label><input type="password" name="password" placeholder="••••••••" required autocomplete="current-password"></div>
+      <button type="submit" class="sub">Ingresar al Sistema →</button>
+    </form>
+  </div>
+
+  <!-- REGISTER FORM (Pure HTML, GET request) -->
+  <div class="f-reg form-container">
+    <form action="" method="GET" target="_self">
+      <input type="hidden" name="action" value="local_register">
+      <input type="hidden" name="local_auth" value="1">
+      <div class="fld"><label>Usuario</label><input type="text" name="username" placeholder="usuario" required autocomplete="username"></div>
+      <div class="fld"><label>Nombre completo</label><input type="text" name="full_name" placeholder="Nombre y Apellido" required autocomplete="name"></div>
+      <div class="fld"><label>Contraseña</label><input type="password" name="password" placeholder="Mínimo 6 caracteres" required autocomplete="new-password"></div>
+      <div class="fld"><label>Hacienda</label><input type="text" name="hacienda" placeholder="Nombre de tu hacienda" value="Hacienda El Encanto" required></div>
+      <button type="submit" class="sub">Crear Cuenta →</button>
+    </form>
+  </div>
+</div>
+</div>
+"""
+
+    st.markdown("""
+    <style>
+    html:has(.f-login) .stApp { background: radial-gradient(circle at 50% 30%, #e0f2fe 0%, #eaf4f8 65%, #dbeafe 100%) !important; }
+    html:has(.f-login) .stMainBlockContainer, html:has(.f-login) .block-container{padding:0!important;max-width:100%!important;}
+    html:has(.f-login) [data-testid="stSidebar"]{display:none!important;}
+    </style>""", unsafe_allow_html=True)
+    
+    st.markdown(auth_html, unsafe_allow_html=True)
+    st.stop()
+
+
+# ── Authenticated area ────────────────────────────────────────────────────────
+current_user = st.session_state.user
+username = current_user["username"]
+current_role = current_user.get("role", "Vaquero")
+animals_list = db.get_all_animals()
+
+
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("""
+    <style>[data-testid="stSidebarContent"]{padding:0!important;}</style>
+    <div style="padding:20px 16px 14px;border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:8px;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div style="width:46px;height:46px;background:linear-gradient(135deg,#0284c7,#0c4a6e);
+          border-radius:14px;display:flex;align-items:center;justify-content:center;
+          font-size:24px;box-shadow:0 6px 18px rgba(2,132,199,0.4);flex-shrink:0;">🐄</div>
+        <div>
+          <div style="font-family:'Outfit',sans-serif;font-weight:800;font-size:1.2rem;color:#fff;line-height:1.1;">BovinoAI</div>
+          <div style="font-size:0.7rem;color:#38bdf8;font-weight:600;letter-spacing:0.5px;">Manta · IA Multiagente</div>
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown(
+        "<p style='font-size:0.68rem;color:#475569;font-weight:700;padding-left:16px;"
+        "margin:6px 0;letter-spacing:1.2px;text-transform:uppercase;'>Menu Principal</p>",
+        unsafe_allow_html=True)
+
+    menu_items = [
+        ("Dashboard",           "📊"),
+        ("Mis Bovinos",         "🐄"),
+        ("Escanear Bovino",     "📷"),
+        ("Diagnosticos",        "🩺"),
+        ("Enciclopedia",        "📖"),
+        ("Mapa de Fincas",      "🗺️"),
+        ("Clima y Suelo",       "🌤️"),
+        ("Asistente IA",        "🤖"),
+        ("Reportes",            "📈"),
+        ("Mercados y Ledger",   "🔗"),
+        ("Capacitacion HITL",   "👨‍⚕️"),
+        ("Configuracion",       "⚙️"),
+    ]
+    for label, icon in menu_items:
+        is_active = st.session_state.active_menu == label
+        if st.button(f"{icon}  {label}", key=f"nav_{label}",
+                     type="primary" if is_active else "secondary"):
+            st.session_state.active_menu = label
+            st.rerun()
+
+    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.07);margin:12px 16px;'>",
+                unsafe_allow_html=True)
+
+    role_color = "#38bdf8" if current_role == "Administrador" else "#86efac" if current_role == "Veterinario" else "#fde047"
+    clerk_av = (st.session_state.clerk_user or {}).get("avatar", "")
+    av_html = (f'<img src="{clerk_av}" style="width:32px;height:32px;border-radius:9999px;border:2px solid #0284c7;"/>'
+               if clerk_av else
+               f'<div style="width:32px;height:32px;background:linear-gradient(135deg,#0284c7,#0c4a6e);border-radius:9999px;'
+               f'display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;">'
+               f'{current_user["full_name"][0].upper()}</div>')
+    clerk_lbl = f'Clerk {"OAuth Google" if CLERK_CONFIGURED else "local"}'
+    st.markdown(f"""
+    <div style="margin:0 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);
+         border-radius:14px;padding:12px 14px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        {av_html}
+        <div>
+          <div style="font-size:0.85rem;font-weight:700;color:#e2e8f0;">{current_user['full_name']}</div>
+          <div style="font-size:0.7rem;color:{role_color};font-weight:600;">{current_role}</div>
+        </div>
+      </div>
+      <div style="font-size:0.68rem;color:#64748b;margin-top:6px;">🔒 {clerk_lbl}</div>
+    </div>""", unsafe_allow_html=True)
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    if st.button("🚪 Cerrar sesion", key="btn_logout"):
+        st.session_state.authenticated = False
+        st.session_state.user = None
+        st.session_state.clerk_user = None
         st.rerun()
 
-# ---------------------------------------------------------
-# TAB 5: BITÁCORA LEDGER
-# ---------------------------------------------------------
-with tab5:
-    st.markdown("### 🔒 Trazabilidad Inmutable (SHA-256)")
-    st.caption("Bitácora auditada digitalmente con sellos de tiempo ISO8601.")
 
-    all_records = get_ledger_records()
-    if all_records:
-        df_ledger = pd.DataFrame(all_records)
-        st.dataframe(
-            df_ledger[["id", "timestamp", "animal_id", "agent_source", "action_type", "hitl_status", "hitl_reviewer", "hash_sha256"]],
-            use_container_width=True
-        )
+# ── TOP HEADER ────────────────────────────────────────────────────────────────
+def top_header():
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        hora = datetime.now().hour
+        saludo = "Buenos dias" if hora < 12 else "Buenas tardes" if hora < 18 else "Buenas noches"
+        nombre = current_user["full_name"].split()[0]
+        st.markdown(f"""
+        <div style="padding:2px 0 10px 0;">
+          <div style="font-size:0.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">
+            Panel de control · {st.session_state.active_menu}
+          </div>
+          <div style="font-family:'Outfit',sans-serif;font-size:1.55rem;font-weight:800;color:#07253a;margin-top:3px;line-height:1.2;">
+            {saludo}, {nombre} 👋
+          </div>
+        </div>""", unsafe_allow_html=True)
+    with col2:
+        cs, cn, cu = st.columns([3, 1, 1])
+        with cs:
+            opts = ["Hacienda El Encanto", "Rancho San Mateo", "Finca Santa Marianita"]
+            sel = st.selectbox("", opts, key="top_hac", label_visibility="collapsed")
+            st.session_state.selected_hacienda = sel
+        with cn:
+            pending_alerts = [r for r in db.get_ledger_records() if r.get("hitl_status") == "PENDIENTE"]
+            sick = [a for a in animals_list if a["current_status"] != "Saludable"]
+            n_total = len(pending_alerts) + len(sick)
+            badge = "🔴" if n_total > 0 else ""
+            with st.popover(f"🔔{badge}", use_container_width=True):
+                st.markdown(f"### 🔔 Notificaciones ({n_total})")
+                if not pending_alerts and not sick:
+                    st.success("Sin alertas activas")
+                else:
+                    if pending_alerts:
+                        st.markdown("**Tickets HITL pendientes**")
+                        for t in pending_alerts[:4]:
+                            st.markdown(f"> Ticket **#{t['id']}** — `{t.get('animal_id','—')}` · {t.get('timestamp','')[:10]}")
+                    if sick:
+                        st.markdown("**Bovinos bajo atencion**")
+                        for a in sick[:4]:
+                            st.markdown(f"> **{a['id']}** {a['name']} — {a['current_status']}")
+                    if st.button("Ver todos los tickets", key="notif_ver"):
+                        st.session_state.active_menu = "Capacitacion HITL"
+                        st.rerun()
+        with cu:
+            init = current_user["full_name"][0].upper()
+            with st.popover(f"👤 {init}", use_container_width=True):
+                st.markdown("### 👤 Mi perfil")
+                if clerk_av:
+                    st.image(clerk_av, width=54)
+                st.markdown(f"""
+                <div style="background:#f0f9ff;border-radius:12px;padding:13px;border:1px solid #bae6fd;margin:8px 0;">
+                  <div style="font-weight:800;color:#07253a;">{current_user['full_name']}</div>
+                  <div style="color:#0284c7;font-size:0.82rem;font-weight:600;margin-top:3px;">{current_role}</div>
+                  <div style="color:#64748b;font-size:0.78rem;margin-top:5px;">🏡 {current_user.get('hacienda','Manta')}</div>
+                  <div style="color:#64748b;font-size:0.78rem;">👤 @{username}</div>
+                  <div style="color:#94a3b8;font-size:0.7rem;margin-top:4px;">🔒 {clerk_lbl}</div>
+                </div>""", unsafe_allow_html=True)
+                if st.button("⚙️ Configuracion", key="prof_cfg", use_container_width=True):
+                    st.session_state.active_menu = "Configuracion"
+                    st.rerun()
+                if st.button("🚪 Cerrar sesion", key="prof_out", use_container_width=True):
+                    st.session_state.authenticated = False
+                    st.session_state.user = None
+                    st.session_state.clerk_user = None
+                    st.rerun()
 
-        st.markdown("#### 🔍 Verificación de Hash SHA-256")
-        sel_id = st.selectbox("Seleccionar Registro de Auditoría:", df_ledger["id"].tolist())
-        rec = next(r for r in all_records if r["id"] == sel_id)
+top_header()
 
-        col_h1, col_h2 = st.columns(2)
-        with col_h1:
-            st.markdown(f"**Hash SHA-256 Actual:**")
-            st.markdown(f"<span class='pill-cyan'>{rec['hash_sha256']}</span>", unsafe_allow_html=True)
-        with col_h2:
-            st.markdown(f"**Hash Anterior (Encadenado):**")
-            st.markdown(f"<span class='pill-cyan'>{rec['previous_hash']}</span>", unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# TAB 6: RENDIMIENTO & COSTOS
-# ---------------------------------------------------------
-with tab6:
-    st.markdown("### 📊 Tablero de Rendimiento Productivo")
-    st.caption("Monitoreo de curvas de ordeño y mermas en San Lorenzo, Santa Marianita y San Mateo.")
+def pill(text, color="blue"):
+    pal = {"blue":("#e0f2fe","#0369a1","#7dd3fc"),"green":("#dcfce7","#15803d","#86efac"),
+           "amber":("#fef3c7","#b45309","#fde047"),"red":("#fee2e2","#b91c1c","#fca5a5")}
+    bg,fg,br = pal.get(color, pal["blue"])
+    return f'<span style="background:{bg};color:{fg};border:1px solid {br};padding:3px 10px;border-radius:9999px;font-size:0.76rem;font-weight:700;">{text}</span>'
 
-    col_m1, col_m2, col_m3 = st.columns(3)
-    with col_m1:
-        st.markdown("""
-        <div class='midnight-card'>
-            <p style='color: #94a3b8; font-size: 0.85rem; margin:0; font-weight:700;'>PRODUCCIÓN PROMEDIO</p>
-            <h2 style='color: #38bdf8; margin: 4px 0; font-weight:800;'>19.3 L / día</h2>
-            <span class='pill-emerald'>San Lorenzo</span>
+
+# ── DASHBOARD ─────────────────────────────────────────────────────────────────
+if st.session_state.active_menu == "Dashboard":
+    hora2 = datetime.now().hour
+    saludo2 = "Buenos dias" if hora2 < 12 else "Buenas tardes" if hora2 < 18 else "Buenas noches"
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#e0f2fe 0%,#bae6fd 60%,#e0f9ff 100%);
+         border-radius:24px;padding:28px 36px 24px;border:1px solid #7dd3fc;margin-bottom:10px;position:relative;overflow:hidden;">
+      <div style="position:absolute;top:-40px;right:-40px;width:180px;height:180px;
+           background:radial-gradient(circle,rgba(2,132,199,0.14) 0%,transparent 70%);border-radius:9999px;"></div>
+      <div style="position:relative;z-index:1;">
+        <div style="font-size:0.68rem;font-weight:800;letter-spacing:1.8px;color:#0369a1;text-transform:uppercase;margin-bottom:10px;">
+          BovinoAI Manta — Plataforma Ganadera Inteligente
         </div>
-        """, unsafe_allow_html=True)
+        <h1 style="font-family:'Outfit',sans-serif;font-size:2rem;font-weight:800;color:#0c4a6e;margin:0 0 10px;line-height:1.2;">
+          {saludo2} — Sistema activo
+        </h1>
+        <p style="color:#0369a1;font-size:0.95rem;margin:0;max-width:560px;line-height:1.6;">
+          Sanidad bovina en tiempo real — detecta afecciones y caidas productivas antes de que el dano sea evidente.
+        </p>
+      </div>
+    </div>""", unsafe_allow_html=True)
 
-    with col_m2:
-        st.markdown("""
-        <div class='midnight-card'>
-            <p style='color: #94a3b8; font-size: 0.85rem; margin:0; font-weight:700;'>PÉRDIDA EVITADA EST.</p>
-            <h2 style='color: #34d399; margin: 4px 0; font-weight:800;'>$350.00 / mes</h2>
-            <span class='pill-emerald'>+35% Eficiencia</span>
-        </div>
-        """, unsafe_allow_html=True)
+    cc1, cc2, cc3 = st.columns([4, 1, 1])
+    with cc2:
+        if st.button("📷 Escanear bovino", type="primary", use_container_width=True):
+            st.session_state.active_menu = "Escanear Bovino"
+            st.rerun()
+    with cc3:
+        if st.button("🤖 Asistente IA", use_container_width=True):
+            st.session_state.active_menu = "Asistente IA"
+            st.rerun()
 
-    with col_m3:
-        st.markdown("""
-        <div class='midnight-card'>
-            <p style='color: #94a3b8; font-size: 0.85rem; margin:0; font-weight:700;'>AGROCALIDAD ECUADOR</p>
-            <h2 style='color: #fbbf24; margin: 4px 0; font-weight:800;'>92% Vacunación</h2>
-            <span class='pill-amber'>Aftosa</span>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-    st.markdown("#### 📈 Curvas Diarias de Producción de Leche (Litros)")
-    chart_rows = []
+    total = len(animals_list)
+    sick_n = len([a for a in animals_list if a["current_status"] != "Saludable"])
+    healthy_pct = round((total - sick_n) / total * 100) if total else 100
+    phitl = len([r for r in db.get_ledger_records() if r.get("hitl_status") == "PENDIENTE"])
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    for col, label, val, desc, icon, ibg, trend, up in [
+        (sc1,"Bovinos activos",str(total),"en el sistema","🌱","#e0f2fe",f"+{total}",True),
+        (sc2,"Bajo atencion",str(sick_n),"requieren revision","⚠️","#fef3c7","ver diagnosticos",False),
+        (sc3,"Tickets HITL",str(phitl),"pendientes firma","🩺","#fce7f3","firma requerida",False),
+        (sc4,"Indice de salud",f"{healthy_pct}%","promedio del rebano","💚","#dcfce7","estable",True),
+    ]:
+        tc = "#15803d" if up else "#b45309"
+        with col:
+            st.markdown(f"""
+            <div style="background:#fff;border-radius:20px;padding:20px 22px;border:1px solid #e0ecf7;
+                 box-shadow:0 4px 20px rgba(7,37,58,0.04);height:124px;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+                <span style="font-size:0.8rem;font-weight:600;color:#64748b;">{label}</span>
+                <div style="background:{ibg};border-radius:10px;width:34px;height:34px;
+                     display:flex;align-items:center;justify-content:center;font-size:16px;">{icon}</div>
+              </div>
+              <div style="font-family:'Outfit',sans-serif;font-size:2rem;font-weight:800;color:#07253a;line-height:1;">{val}</div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
+                <span style="font-size:0.75rem;color:#94a3b8;">{desc}</span>
+                <span style="font-size:0.72rem;color:{tc};font-weight:700;">{trend}</span>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+
+    if sick_n > 0 or phitl > 0:
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#fffbeb,#fef9c3);border:1.5px solid #fde047;
+             border-radius:20px;padding:18px 22px;margin-bottom:20px;">
+          <div style="font-family:'Outfit',sans-serif;font-weight:800;font-size:1rem;color:#b45309;margin-bottom:10px;">
+            ⚠️ Alertas activas
+            <span style="background:#fde047;color:#92400e;padding:2px 10px;border-radius:9999px;font-size:0.72rem;font-weight:800;margin-left:8px;">
+              {sick_n + phitl} elementos
+            </span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div style="background:rgba(255,255,255,0.7);border-radius:12px;padding:12px 16px;border:1px solid #fef08a;">
+              <div style="font-weight:700;color:#0f2942;font-size:0.88rem;">🐄 Bovinos bajo atencion</div>
+              <div style="font-size:0.8rem;color:#64748b;margin-top:4px;">{sick_n} animal(es) bajo observacion o tratamiento</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.7);border-radius:12px;padding:12px 16px;border:1px solid #fef08a;">
+              <div style="font-weight:700;color:#0f2942;font-size:0.88rem;">🩺 Tickets HITL pendientes</div>
+              <div style="font-size:0.8rem;color:#64748b;margin-top:4px;">{phitl} ticket(s) esperan firma veterinaria</div>
+            </div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    cm, cd = st.columns([1.6, 1])
+    with cm:
+        st.markdown('<div style="background:#fff;border-radius:20px;padding:20px;border:1px solid #e0ecf7;'
+                    'box-shadow:0 4px 20px rgba(7,37,58,0.04);">'
+                    '<div style="font-family:\'Outfit\',sans-serif;font-size:1rem;font-weight:800;color:#07253a;margin-bottom:12px;">🗺️ Mapa de fincas</div>',
+                    unsafe_allow_html=True)
+        poly = db.get_farm_perimeter(st.session_state.selected_hacienda) or [
+            {"latitude":-1.055,"longitude":-80.905},{"latitude":-1.052,"longitude":-80.892},
+            {"latitude":-1.062,"longitude":-80.888},{"latitude":-1.065,"longitude":-80.901},
+            {"latitude":-1.055,"longitude":-80.905}]
+        clat = sum(p["latitude"] for p in poly)/len(poly)
+        clon = sum(p["longitude"] for p in poly)/len(poly)
+        m = folium.Map(location=[clat,clon],zoom_start=13,tiles="CartoDB positron")
+        folium.Polygon([[p["latitude"],p["longitude"]] for p in poly],
+                       color="#0284c7",weight=3,fill=True,fill_color="#38bdf8",fill_opacity=0.15).add_to(m)
+        for a in animals_list:
+            clr = "green" if a["current_status"]=="Saludable" else "orange" if a["current_status"]=="Bajo Observacion" else "red"
+            folium.CircleMarker([a.get("latitude",-1.058),a.get("longitude",-80.897)],
+                                radius=9,color=clr,fill=True,fill_color=clr,fill_opacity=0.85,
+                                popup=folium.Popup(f"<b>{a['id']} – {a['name']}</b><br>{a['current_status']}",max_width=180)).add_to(m)
+        st_folium(m,width="100%",height=290,key="dash_map")
+        st.markdown("</div>",unsafe_allow_html=True)
+
+    with cd:
+        st.markdown('<div style="background:#fff;border-radius:20px;padding:20px;border:1px solid #e0ecf7;'
+                    'box-shadow:0 4px 20px rgba(7,37,58,0.04);">',unsafe_allow_html=True)
+        sanos=len([a for a in animals_list if a["current_status"]=="Saludable"])
+        riesgo=len([a for a in animals_list if a["current_status"]=="Bajo Observacion"])
+        infect=len([a for a in animals_list if a["current_status"]=="En Tratamiento"])
+        tot=max(1,len(animals_list))
+        st.markdown('<div style="font-family:\'Outfit\',sans-serif;font-size:1rem;font-weight:800;color:#07253a;margin-bottom:4px;">Estado del rebano</div>',
+                    unsafe_allow_html=True)
+        fig=go.Figure(go.Pie(labels=["Sanos","Riesgo","Tratamiento"],values=[sanos,riesgo,infect],
+                             hole=0.72,marker_colors=["#15803d","#eab308","#dc2626"],textinfo="none"))
+        fig.add_annotation(text=f"<b>{sanos}/{tot}</b>",x=0.5,y=0.5,
+                           font=dict(size=18,color="#07253a",family="Outfit"),showarrow=False)
+        fig.update_layout(showlegend=False,margin=dict(t=10,b=0,l=0,r=0),height=190,paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig,use_container_width=True)
+        for lbl,val_n,color,icon in [("Sanos",sanos,"#15803d","🟢"),("En riesgo",riesgo,"#eab308","🟡"),("Tratamiento",infect,"#dc2626","🔴")]:
+            pct=round(val_n/tot*100)
+            st.markdown(f"""
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                 margin-bottom:9px;padding:8px 12px;background:#f8fafc;border-radius:10px;border:1px solid #e0ecf7;">
+              <div style="display:flex;align-items:center;gap:8px;">{icon}
+                <span style="font-size:0.84rem;color:#64748b;font-weight:600;">{lbl}</span>
+              </div>
+              <div><span style="font-weight:800;color:#0f2942;font-size:0.9rem;">{val_n}</span>
+                <span style="font-size:0.74rem;color:#94a3b8;margin-left:4px;">({pct}%)</span>
+              </div>
+            </div>""",unsafe_allow_html=True)
+        st.markdown("</div>",unsafe_allow_html=True)
+
+
+# ── MIS BOVINOS ───────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Mis Bovinos":
+    st.markdown('<h2 style="font-family:\'Outfit\',sans-serif;font-size:1.6rem;font-weight:800;color:#07253a;margin:0 0 4px;">🐄 Inventario de Bovinos</h2><p style="color:#64748b;font-size:0.9rem;margin:0 0 18px;">Hoja de vida ganadera, raza, produccion y estado sanitario.</p>',unsafe_allow_html=True)
+    cols=st.columns(3)
+    for i,a in enumerate(animals_list):
+        sc=a["current_status"]
+        color="#15803d" if sc=="Saludable" else "#eab308" if sc=="Bajo Observacion" else "#dc2626"
+        with cols[i%3]:
+            st.markdown(f"""
+            <div style="background:#fff;border-radius:20px;padding:22px;border:1px solid #e0ecf7;
+                 box-shadow:0 4px 20px rgba(7,37,58,0.04);margin-bottom:16px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                {pill(a['id'],'blue')}
+                <span style="background:{color}18;color:{color};border:1px solid {color}44;
+                     padding:3px 10px;border-radius:9999px;font-size:0.76rem;font-weight:700;">{sc}</span>
+              </div>
+              <div style="font-family:'Outfit',sans-serif;font-size:1.15rem;font-weight:800;color:#07253a;margin-bottom:3px;">{a['name']}</div>
+              <div style="font-size:0.82rem;color:#94a3b8;margin-bottom:12px;">{a['breed']} · {a['purpose']}</div>
+              <hr style="border:none;border-top:1px solid #f1f5f9;margin:10px 0;">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                <div style="background:#f8fafc;border-radius:10px;padding:8px 10px;">
+                  <div style="font-size:0.7rem;color:#94a3b8;font-weight:600;">HACIENDA</div>
+                  <div style="font-size:0.83rem;color:#0f2942;font-weight:700;margin-top:2px;">📍 {a['hacienda']}</div>
+                </div>
+                <div style="background:#f8fafc;border-radius:10px;padding:8px 10px;">
+                  <div style="font-size:0.7rem;color:#94a3b8;font-weight:600;">PRODUCCION</div>
+                  <div style="font-size:0.83rem;color:#0284c7;font-weight:700;margin-top:2px;">🥛 {a['avg_milk_daily_liters']} L/dia</div>
+                </div>
+                <div style="background:#f8fafc;border-radius:10px;padding:8px 10px;">
+                  <div style="font-size:0.7rem;color:#94a3b8;font-weight:600;">PESO</div>
+                  <div style="font-size:0.83rem;color:#0f2942;font-weight:700;margin-top:2px;">⚖️ {a['weight_kg']} kg</div>
+                </div>
+                <div style="background:#f8fafc;border-radius:10px;padding:8px 10px;">
+                  <div style="font-size:0.7rem;color:#94a3b8;font-weight:600;">NACIMIENTO</div>
+                  <div style="font-size:0.83rem;color:#0f2942;font-weight:700;margin-top:2px;">📅 {a['birth_date']}</div>
+                </div>
+              </div>
+            </div>""",unsafe_allow_html=True)
+
+
+# ── ESCANEAR BOVINO ───────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Escanear Bovino":
+    st.markdown('<div style="background:#fff;border-radius:20px;padding:24px;border:1px solid #e0ecf7;box-shadow:0 4px 20px rgba(7,37,58,0.04);margin-bottom:18px;"><h3 style="font-family:\'Outfit\',sans-serif;font-weight:800;color:#07253a;margin:0 0 6px;">📷 Ingesta de Campo – Evaluacion Multiagente</h3><p style="color:#64748b;font-size:0.9rem;margin:0;">Selecciona el bovino, describe los sintomas y la red de IA evaluara el caso en tiempo real.</p></div>',unsafe_allow_html=True)
+    ci,cn=st.columns([1,2],gap="large")
+    with ci:
+        st.markdown("##### 1. Identificar Bovino")
+        opts=[f"{a['id']} – {a['name']} ({a['breed']})" for a in animals_list]
+        sel_str=st.selectbox("Arete / QR",opts,key="scan_sel")
+        sel_id=sel_str.split(" – ")[0]
+        prof=db.get_animal_by_id_or_qr(sel_id)
+        if prof:
+            sc=prof["current_status"]
+            color="#15803d" if sc=="Saludable" else "#eab308" if sc=="Bajo Observacion" else "#dc2626"
+            st.markdown(f'<div style="background:#f0f9ff;padding:16px;border-radius:16px;border:1px solid #bae6fd;font-size:0.88rem;color:#0f2942;"><b>Nombre:</b> {prof["name"]}<br><b>Raza:</b> {prof["breed"]} ({prof["purpose"]})<br><b>Hacienda:</b> {prof["hacienda"]}<br><b>Leche prom.:</b> {prof["avg_milk_daily_liters"]} L/dia<br><b>Estado:</b> <span style="background:{color}18;color:{color};border:1px solid {color}44;padding:2px 8px;border-radius:9999px;font-weight:700;">{sc}</span></div>',unsafe_allow_html=True)
+    with cn:
+        st.markdown("##### 2. Novedad de Campo")
+        narrative=st.text_area("Describe los sintomas:",value="La vaca tiene la ubre muy caliente e hinchada y produjo 4.5 litros menos de leche.",height=120,key="scan_narrative")
+        fc1,fc2=st.columns([2,1])
+        with fc1:
+            img_file=st.file_uploader("📷 Foto (opcional)",type=["jpg","png","jpeg"])
+        with fc2:
+            if img_file:
+                st.image(img_file,width=120)
+        img_desc=f"Fotografia: inspeccion bovino ({img_file.name})" if img_file else None
+        st.markdown("<div style='height:10px'></div>",unsafe_allow_html=True)
+        if st.button("✨ Procesar con Red Multiagente",type="primary",use_container_width=True,key="btn_scan"):
+            with st.spinner("Evaluando con red multiagente IA..."):
+                result=orchestrator.process_field_report(qr_or_id=sel_id,user_narrative=narrative,username=username,image_description=img_desc)
+                st.session_state["latest_evaluation"]=result
+            if result["success"]:
+                st.toast("Evaluacion completada",icon="✅")
+                if result["requires_hitl_approval"]:
+                    st.warning(f"Alerta sanitaria — Ticket #{result['hitl_ticket_id']} requiere firma en Capacitacion HITL")
+                san=result["agent_outputs"]["sanitary"]
+                prod=result["agent_outputs"]["productive"]
+                r1,r2,r3=st.columns(3)
+                for col,bg,br,title,body in [
+                    (r1,"#f0fdf4","#86efac","🩺 Pre-diagnostico",f"<b>{san['pre_diagnosis']}</b><br><small>Confianza: {san['confidence_percent']}% · Severidad: {san['severity']}</small>"),
+                    (r2,"#fef9ec","#fde047","📈 Produccion",f"Caida: <b>{prod['drop_percentage']}%</b><br><small>Perdida: ${prod['estimated_daily_financial_loss_usd']}/dia</small>"),
+                    (r3,"#f0f9ff","#7dd3fc","💊 Tratamiento",f"<small>{san['recommended_treatment_plan']}</small>"),
+                ]:
+                    with col:
+                        st.markdown(f'<div style="background:{bg};border-radius:14px;padding:14px;border:1px solid {br};"><b style="color:#0f2942;">{title}</b><br>{body}</div>',unsafe_allow_html=True)
+            else:
+                st.error(f"Error: {result.get('error','Desconocido')}")
+
+
+# ── DIAGNOSTICOS ──────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Diagnosticos":
+    st.markdown("### 🩺 Diagnosticos Multiagente")
+    latest=st.session_state.get("latest_evaluation")
+    if not latest:
+        st.info("Realiza una ingesta en **Escanear Bovino** para ver el diagnostico detallado.")
+    else:
+        out=latest["agent_outputs"]
+        ident,san,prod,ledg=out["identifier"],out["sanitary"],out["productive"],out["ledger"]
+        c1,c2,c3,c4=st.columns(4)
+        for col,title,color,items in [
+            (c1,"🔍 Identificacion","#0284c7",[("Arete",ident["animal_id"]),("Nombre",ident["animal_name"]),("Hacienda",ident["hacienda"])]),
+            (c2,"🩺 Sanitario","#15803d",[("Diagnostico",san["pre_diagnosis"]),("Confianza",f"{san['confidence_percent']}%"),("Severidad",san["severity"])]),
+            (c3,"📈 Productivo","#b45309",[("Caida",f"{prod['drop_percentage']}%"),("Perdida",f"${prod['estimated_daily_financial_loss_usd']}/dia")]),
+            (c4,"🔒 Ledger","#07253a",[("Ticket",f"#{ledg['ledger_ticket_id']}"),("HITL",ledg["hitl_status"])]),
+        ]:
+            with col:
+                rows="".join(f'<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f1f5f9;"><span style="font-size:0.82rem;color:#64748b;font-weight:600;">{k}</span><span style="font-size:0.83rem;color:#0f2942;font-weight:700;text-align:right;">{v}</span></div>' for k,v in items)
+                st.markdown(f'<div style="background:#fff;border-radius:18px;padding:18px;border:1px solid #e0ecf7;box-shadow:0 4px 14px rgba(7,37,58,0.03);"><h4 style="color:{color};margin:0 0 12px;font-size:0.95rem;font-family:\'Outfit\',sans-serif;">{title}</h4>{rows}</div>',unsafe_allow_html=True)
+        with st.expander("Ver resumen completo del flujo multiagente"):
+            st.markdown(latest.get("workflow_summary",""))
+            st.caption(san.get("disclaimer",""))
+
+
+# ── ENCICLOPEDIA ──────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Enciclopedia":
+    st.markdown("### 📖 Enciclopedia Clinica Bovina")
+    for e in [
+        {"n":"Mastitis Bovina","r":"ALTA","c":"#b45309","s":"Ubre hinchada y caliente, grumos en leche, caida de produccion.","t":"Prueba CMT, infusion intramamaria, aislamiento 48h."},
+        {"n":"Anaplasmosis / Babesiosis","r":"CRITICA","c":"#b91c1c","s":"Fiebre alta, anemia, mucosas palidas o amarillentas.","t":"Hemograma urgente, imidocarb / oxitetraciclina."},
+        {"n":"Sospecha de Fiebre Aftosa","r":"EMERGENCIA","c":"#7c3aed","s":"Aftas en boca y pezunas, salivacion excesiva, cojera.","t":"Aislamiento inmediato y reporte a AGROCALIDAD Ecuador."},
+        {"n":"Neumonia Bovina","r":"MEDIA-ALTA","c":"#0369a1","s":"Tos, secrecion nasal, dificultad respiratoria.","t":"Antibioticoterapia sistemica y refugio seco y ventilado."},
+        {"n":"Parasitosis Gastrointestinal","r":"MODERADA","c":"#047857","s":"Perdida de peso, pelaje opaco, diarrea, edema submandibular.","t":"Coproparasitologico, Ivermectina o Albendazol."},
+    ]:
+        ic = "🔴" if e['r'] in ['CRITICA','EMERGENCIA'] else "🟡" if e['r']=="ALTA" else "🟢"
+        with st.expander(f"{ic} {e['n']} — Riesgo: {e['r']}"):
+            c1e,c2e=st.columns(2)
+            with c1e: st.markdown(f"**Sintomas:**\n{e['s']}")
+            with c2e: st.markdown(f"**Tratamiento:**\n{e['t']}")
+
+
+# ── MAPA DE FINCAS ────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Mapa de Fincas":
+    st.markdown("### 🗺️ Delimitacion de Recintos y Geofencing GPS")
+    poly=db.get_farm_perimeter(st.session_state.selected_hacienda) or [
+        {"latitude":-1.055,"longitude":-80.905},{"latitude":-1.052,"longitude":-80.892},
+        {"latitude":-1.062,"longitude":-80.888},{"latitude":-1.065,"longitude":-80.901},
+        {"latitude":-1.055,"longitude":-80.905}]
+    clat=sum(p["latitude"] for p in poly)/len(poly)
+    clon=sum(p["longitude"] for p in poly)/len(poly)
+    m2=folium.Map(location=[clat,clon],zoom_start=14,tiles="OpenStreetMap")
+    folium.Polygon([[p["latitude"],p["longitude"]] for p in poly],color="#0284c7",weight=3,fill=True,fill_color="#0284c7",fill_opacity=0.2).add_to(m2)
     for a in animals_list:
-        for ml in a.get("recent_milk_logs", []):
-            chart_rows.append({
-                "Bovino": f"{a['id']} ({a['name']})",
-                "Fecha": ml["date"],
-                "Litros": ml["liters"],
-                "Hacienda": a["hacienda"]
-            })
+        clr="green" if a["current_status"]=="Saludable" else "orange" if a["current_status"]=="Bajo Observacion" else "red"
+        folium.Marker([a.get("latitude",-1.058),a.get("longitude",-80.897)],
+                      popup=folium.Popup(f"<b>{a['id']}: {a['name']}</b><br>{a['current_status']}",max_width=200),
+                      icon=folium.Icon(color=clr,icon="info-sign")).add_to(m2)
+    Draw(export=True).add_to(m2)
+    st_folium(m2,width="100%",height=500,key="full_map")
 
-    if chart_rows:
-        df_chart = pd.DataFrame(chart_rows)
-        fig = px.line(
-            df_chart,
-            x="Fecha",
-            y="Litros",
-            color="Bovino",
-            line_shape="spline",
-            markers=True
-        )
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_family="Plus Jakarta Sans",
-            font_color="#f8fafc"
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------------------------------
-# TAB 7: IMPACTO ODS 8 & ODS 9
-# ---------------------------------------------------------
-with tab7:
-    st.markdown("### 🌐 Impacto en Objetivos de Desarrollo Sostenible")
+# ── CLIMA Y SUELO ─────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Clima y Suelo":
+    st.markdown("### 🌤️ Monitoreo Agroclimatico — Manta, Manabi")
+    c1,c2,c3=st.columns(3)
+    for col,title,val,badge,bc,desc in [
+        (c1,"🌡️ Temperatura","28.5 °C","Estable","#0369a1","Condicion favorable para el ganado"),
+        (c2,"💧 Humedad Relativa","72 %","Zona costera","#b45309","Monitorear ventilacion en establos"),
+        (c3,"📊 Indice ITH","74.2","Estres leve","#15803d","Considera sombra adicional a mediodia"),
+    ]:
+        with col:
+            st.markdown(f'<div style="background:#fff;border-radius:18px;padding:22px;border:1px solid #e0ecf7;box-shadow:0 4px 14px rgba(7,37,58,0.03);"><div style="font-size:0.88rem;font-weight:700;color:#64748b;margin-bottom:10px;">{title}</div><div style="font-family:\'Outfit\',sans-serif;font-size:2rem;font-weight:800;color:#0f2942;">{val}</div><div style="margin-top:10px;"><span style="background:{bc}18;color:{bc};border:1px solid {bc}44;padding:3px 10px;border-radius:9999px;font-size:0.76rem;font-weight:700;">{badge}</span></div><div style="font-size:0.78rem;color:#94a3b8;margin-top:10px;">{desc}</div></div>',unsafe_allow_html=True)
 
-    col_o1, col_o2 = st.columns(2)
-    with col_o1:
-        st.markdown("""
-        <div class='midnight-card'>
-            <h4 style='color: #38bdf8; margin-top:0;'>📈 ODS 8: Trabajo Decente & Crecimiento Económico</h4>
-            <ul style='color: #cbd5e1; font-size: 0.9rem; line-height: 1.6;'>
-                <li><b>Simplificación Digital:</b> Reduce el tiempo de registro de 2 hours a 5 minutos dictados por voz.</li>
-                <li><b>Protección de Ingresos:</b> Mitiga pérdidas del 35% mediante pre-diagnósticos veterinarios tempranos.</li>
-                <li><b>Mercados Transparentes:</b> Certificación trazable del ganado de Manabí.</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
 
-    with col_o2:
-        st.markdown("""
-        <div class='midnight-card'>
-            <h4 style='color: #34d399; margin-top:0;'>🏗️ ODS 9: Industria, Innovación e Infraestructura</h4>
-            <ul style='color: #cbd5e1; font-size: 0.9rem; line-height: 1.6;'>
-                <li><b>Innovación en Campo:</b> Multiagente de IA, dibujo en mapa y QR en San Lorenzo, Santa Marianita y San Mateo.</li>
-                <li><b>Criptografía Inmutable:</b> Sellado con marcas de tiempo e identificadores SHA-256.</li>
-                <li><b>Bienestar Animal:</b> Garantiza aprobación humana (HITL) previa aplicación de tratamientos.</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
+# ── ASISTENTE IA ──────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Asistente IA":
+    st.markdown('<div style="background:#fff;border-radius:20px;padding:20px 24px;border:1px solid #e0ecf7;box-shadow:0 4px 20px rgba(7,37,58,0.04);margin-bottom:16px;"><h3 style="font-family:\'Outfit\',sans-serif;font-weight:800;color:#07253a;margin:0 0 4px;">🤖 Asistente BovinoAI</h3><p style="color:#64748b;font-size:0.88rem;margin:0;">Diagnostico IA. Menciona el ID del bovino y los sintomas para analisis inmediato.</p></div>',unsafe_allow_html=True)
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+    user_q=st.chat_input("Ej.: 'La vaca BOV-104 tiene fiebre y la ubre caliente. Que puede ser?'")
+    if user_q:
+        st.session_state.chat_history.append({"role":"user","content":user_q})
+        with st.chat_message("user"): st.markdown(user_q)
+        with st.chat_message("assistant"):
+            with st.spinner("Analizando con IA multiagente..."):
+                q_lower=user_q.lower()
+                ma=next((a for a in animals_list if a["id"].lower() in q_lower or a["name"].lower() in q_lower),None)
+                if ma:
+                    result=orchestrator.process_field_report(qr_or_id=ma["id"],user_narrative=user_q,username=username)
+                    if result["success"]:
+                        san=result["agent_outputs"]["sanitary"]
+                        prod=result["agent_outputs"]["productive"]
+                        answer=(f"📋 **Analisis para {ma['name']} ({ma['id']})**\n\n"
+                                f"**Pre-diagnostico:** {san['pre_diagnosis']}\n"
+                                f"**Confianza:** {san['confidence_percent']}% · **Severidad:** {san['severity']}\n\n"
+                                f"**Tratamiento:**\n{san['recommended_treatment_plan']}\n\n"
+                                f"**Impacto productivo:** Caida del {prod['drop_percentage']}% · ${prod['estimated_daily_financial_loss_usd']}/dia\n\n"
+                                f"*{san['disclaimer']}*")
+                        if result["requires_hitl_approval"]:
+                            answer+=f"\n\n🚨 **Ticket HITL #{result['hitl_ticket_id']} generado** — requiere firma del veterinario."
+                    else:
+                        answer=f"No pude procesar: {result.get('error')}"
+                elif any(w in q_lower for w in ["cuantos","rebano","ganado","inventario","lista","bovinos"]):
+                    sanos_n=len([a for a in animals_list if a["current_status"]=="Saludable"])
+                    tot=max(1,len(animals_list))
+                    answer=(f"📊 **Estado del rebano — {st.session_state.selected_hacienda}:**\n\n"
+                            f"- **Total:** {tot} bovinos\n- **Sanos:** {sanos_n} ({round(sanos_n/tot*100)}%)\n- **Con atencion:** {tot-sanos_n}\n\n")
+                    for a in animals_list:
+                        ic="🟢" if a["current_status"]=="Saludable" else "🟡" if a["current_status"]=="Bajo Observacion" else "🔴"
+                        answer+=f"{ic} **{a['id']}** – {a['name']} | {a['breed']} | {a['avg_milk_daily_liters']} L/dia\n"
+                else:
+                    from tools.vet_rules import evaluate_clinical_symptoms
+                    diag=evaluate_clinical_symptoms(user_q)
+                    if diag["pre_diagnosis"]!="Indeterminado / Evaluacion General Requerida":
+                        answer=(f"🔍 **Analisis de sintomas:**\n\n**Posible condicion:** {diag['pre_diagnosis']}\n"
+                                f"**Confianza:** {diag['confidence_percent']}% · **Severidad:** {diag['severity']}\n\n"
+                                f"**Recomendacion:** {diag['recommended_action']}\n\n💡 Para analisis completo ve a **Escanear Bovino**.")
+                    elif any(w in q_lower for w in ["hola","ayuda","como","puedes"]):
+                        answer=("👋 Hola! Soy **BovinoAI**.\n\n**Puedo ayudarte con:**\n"
+                                "- 🩺 Diagnostico — menciona el ID del bovino y sintomas\n"
+                                "- 📊 Estado del rebano — pregunta 'cuantos bovinos tengo'\n"
+                                "- 💊 Info de enfermedades — mastitis, aftosa, etc.")
+                    else:
+                        fid=animals_list[0]["id"] if animals_list else "BOV-104"
+                        answer=(f"No identifique sintomas especificos. Intenta con:\n"
+                                f'- *"La vaca {fid} tiene fiebre y no come"*\n'
+                                f"- *Cuantos bovinos tengo activos?*")
+            st.markdown(answer)
+            st.session_state.chat_history.append({"role":"assistant","content":answer})
 
-    st.markdown("<p style='text-align: center; color: #64748b; margin-top: 24px; font-size: 0.85rem;'>✨ BovinoAI Manta v1.0 — Dibujo Interactivo en Mapa Folium</p>", unsafe_allow_html=True)
+
+# ── REPORTES ──────────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Reportes":
+    st.markdown("### 📈 Reportes de Produccion")
+    rows=[]
+    for a in animals_list:
+        for ml in a.get("recent_milk_logs",[]):
+            rows.append({"Bovino":f"{a['id']} ({a['name']})","Fecha":ml["date"],"Litros":ml["liters"]})
+    if rows:
+        df=pd.DataFrame(rows)
+        fig=px.line(df,x="Fecha",y="Litros",color="Bovino",markers=True,
+                    color_discrete_sequence=["#0284c7","#15803d","#b45309"],
+                    title="Produccion de Leche (L/dia) por Bovino")
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font_family="Plus Jakarta Sans")
+        fig.update_xaxes(showgrid=False)
+        fig.update_yaxes(gridcolor="#f1f5f9")
+        st.plotly_chart(fig,use_container_width=True)
+    else:
+        st.info("Sin datos de ordeno registrados todavia.")
+
+
+# ── MERCADOS Y LEDGER ─────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Mercados y Ledger":
+    st.markdown("### 🔗 Cadena de Auditoria SHA-256")
+    recs=db.get_ledger_records()
+    if recs:
+        df=pd.DataFrame(recs)
+        cols_show=[c for c in ["id","timestamp","animal_id","agent_source","hitl_status","hitl_reviewer","hash_sha256"] if c in df.columns]
+        st.dataframe(df[cols_show],use_container_width=True)
+    else:
+        st.info("Sin registros en el ledger todavia.")
+
+
+# ── CAPACITACION HITL ─────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Capacitacion HITL":
+    st.markdown("### 👨‍⚕️ Supervision Medica — Human-In-The-Loop")
+    st.caption("Solo el veterinario puede aprobar o rechazar tratamientos. Ningun farmaco se aplica de forma autonoma.")
+    pending=[r for r in db.get_ledger_records() if r.get("hitl_status")=="PENDIENTE"]
+    if not pending:
+        st.success("Todos los tickets han sido revisados. Sin acciones pendientes.")
+    else:
+        st.warning(f"🚨 {len(pending)} ticket(s) requieren firma veterinaria.")
+        for t in pending:
+            tid=t["id"]
+            payload=t.get("payload",{})
+            san=payload.get("sanitary",{})
+            prod=payload.get("productive",{})
+            with st.expander(f"Ticket #{tid} — Bovino {t.get('animal_id')} · {t.get('timestamp','')[:10]}"):
+                c1t,c2t=st.columns(2)
+                with c1t:
+                    st.markdown(f"**Pre-diagnostico:** {san.get('pre_diagnosis','—')}")
+                    st.markdown(f"**Severidad:** {san.get('severity','—')}")
+                with c2t:
+                    st.markdown(f"**Caida productiva:** {prod.get('drop_percentage','—')}%")
+                    st.markdown(f"**Perdida/dia:** ${prod.get('estimated_daily_financial_loss_usd','—')}")
+                st.markdown(f"**Tratamiento propuesto:** {san.get('recommended_treatment_plan','—')}")
+                prescripcion=st.text_area("Prescripcion medica:",key=f"presc_{tid}",value="Tratamiento validado. Aplicar conforme a protocolo clinico.")
+                hc1,hc2,hc3=st.columns(3)
+                with hc1:
+                    if st.button(f"Aprobar #{tid}",key=f"ap_{tid}",type="primary"):
+                        orchestrator.resolve_hitl_ticket(tid,"APROBADO",f"{username} (Veterinario)",prescripcion)
+                        st.toast(f"Ticket #{tid} aprobado",icon="✅"); st.rerun()
+                with hc2:
+                    if st.button(f"Modificar #{tid}",key=f"mo_{tid}"):
+                        orchestrator.resolve_hitl_ticket(tid,"MODIFICADO",f"{username} (Veterinario)",prescripcion)
+                        st.toast(f"Ticket #{tid} modificado",icon="✏️"); st.rerun()
+                with hc3:
+                    if st.button(f"Rechazar #{tid}",key=f"re_{tid}"):
+                        orchestrator.resolve_hitl_ticket(tid,"RECHAZADO",f"{username} (Veterinario)",prescripcion)
+                        st.toast(f"Ticket #{tid} rechazado",icon="❌"); st.rerun()
+
+
+# ── CONFIGURACION ─────────────────────────────────────────────────────────────
+elif st.session_state.active_menu == "Configuracion":
+    st.markdown("### ⚙️ Administracion del Sistema")
+    if current_role != "Administrador":
+        st.warning("Acceso restringido a Administradores.")
+    else:
+        tab1,tab2,tab3=st.tabs(["👥 Usuarios","🐄 Bovinos","🔒 Clerk API"])
+        with tab1:
+            users=db.get_all_users()
+            if users:
+                st.dataframe(pd.DataFrame(users)[["username","full_name","role","hacienda"]],use_container_width=True)
+            with st.expander("Agregar usuario"):
+                nu=st.text_input("Usuario",key="cfg_u"); nn=st.text_input("Nombre",key="cfg_n")
+                nr=st.selectbox("Rol",["Administrador","Veterinario","Vaquero","Tecnico"],key="cfg_r")
+                nh=st.text_input("Hacienda",value="Hacienda El Encanto",key="cfg_h")
+                if st.button("Guardar",key="cfg_save"):
+                    if nu and nn: db.add_user(nu,nn,nr,nh); st.success(f"Usuario {nu} guardado."); st.rerun()
+                    else: st.error("Completa los campos.")
+            with st.expander("Eliminar usuario"):
+                du=st.text_input("Usuario a eliminar",key="cfg_del")
+                if st.button("Eliminar",key="cfg_del_btn"):
+                    if du: ok=db.delete_user(du); (st.success(f"Eliminado: {du}") if ok else st.error("No encontrado.")); st.rerun()
+        with tab2:
+            with st.expander("Agregar bovino"):
+                b1,b2=st.columns(2)
+                with b1:
+                    bid=st.text_input("ID/ARETE",key="b_id"); bqr=st.text_input("QR",key="b_qr")
+                    bname=st.text_input("Nombre",key="b_name"); bbreed=st.text_input("Raza",key="b_breed")
+                with b2:
+                    bpur=st.text_input("Proposito",key="b_pur"); bhac=st.text_input("Hacienda",value="Hacienda El Encanto",key="b_hac")
+                    bloc=st.text_input("Ubicacion",key="b_loc"); bbd=st.text_input("Nacimiento",value="2022-01-01",key="b_bd")
+                blat=st.number_input("Latitud",value=-1.058,format="%.6f",key="b_lat")
+                blon=st.number_input("Longitud",value=-80.897,format="%.6f",key="b_lon")
+                bw=st.number_input("Peso (kg)",value=250.0,key="b_w")
+                bml=st.number_input("Leche prom. (L/dia)",value=8.0,key="b_ml")
+                bst=st.selectbox("Estado",["Saludable","Bajo Observacion","En Tratamiento"],key="b_st")
+                if st.button("Agregar bovino",key="b_add"):
+                    try:
+                        db.add_animal(bid,bqr,bname,bbreed,bpur,bhac,bloc,float(blat),float(blon),bbd,float(bw),float(bml),bst)
+                        st.success(f"Bovino {bid} agregado."); st.rerun()
+                    except Exception as e: st.error(str(e))
+        with tab3:
+            st.markdown("### 🔒 Configuracion de Clerk API")
+            st.markdown(f"""
+**Estado:** {"✅ Clerk configurado y activo (OAuth Google habilitado)" if CLERK_CONFIGURED else "⚠️ Autenticacion local activa (Clerk no configurado)"}
+
+**Para activar Clerk con Google OAuth:**
+1. Ve a [dashboard.clerk.com](https://dashboard.clerk.com) y crea una aplicacion
+2. En **Social Connections** → activa **Google**
+3. Copia tu **Publishable Key** (`pk_live_...` o `pk_test_...`)
+4. Agrega en tu `.env`:
+```
+CLERK_PUBLISHABLE_KEY=pk_live_tu_clave_aqui
+```
+5. Reinicia la app: `streamlit run ui/app.py`
+
+**Clave actual:** `{CLERK_PUB_KEY[:26] if CLERK_PUB_KEY else "No configurada"}...` {"(real)" if CLERK_CONFIGURED else "(placeholder — reemplazar)"}
+            """)

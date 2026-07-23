@@ -1,4 +1,4 @@
-# 🐄 BovinoAI Manta: Sistema Multiagente para Identificación, Control Sanitario y Trazabilidad Ganadera
+# 🐄 Bovi Manta: Sistema Multiagente para Identificación, Control Sanitario y Trazabilidad Ganadera
 
 > **Solución Multiagente de IA para la Gestión Ganadera Bovina en Manta y la Provincia de Manabí.**  
 > *Alineado con el **ODS 8 (Trabajo Decente y Crecimiento Económico)** y el **ODS 9 (Industria, Innovación e Infraestructura)**.*
