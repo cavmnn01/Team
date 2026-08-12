@@ -170,7 +170,8 @@ header[data-testid="stHeader"]{background:transparent!important;}
 
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#07253a 0%,#051b2b 100%)!important;border-right:1px solid rgba(255,255,255,0.06)!important;}
 [data-testid="stSidebarUserContent"]{
-    padding-top:0.5rem!important;
+    padding-top:0!important;
+    margin-top:-3rem!important;
 }
 [data-testid="stSidebar"] *{color:#e2e8f0!important;}
 [data-testid="stSidebarContent"]{padding:0!important;}
@@ -430,7 +431,7 @@ animals_list = db.get_all_animals()
 with st.sidebar:
     st.markdown("""
     <style>[data-testid="stSidebarContent"]{padding:0!important;}</style>
-    <div style="padding:20px 16px 14px;border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:8px;">
+    <div style="padding:8px 16px 14px;border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:8px;">
       <div style="display:flex;align-items:center;gap:12px;">
         <div style="width:46px;height:46px;background:linear-gradient(135deg,#0284c7,#0c4a6e);
           border-radius:14px;display:flex;align-items:center;justify-content:center;
