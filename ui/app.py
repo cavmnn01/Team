@@ -99,34 +99,79 @@ st.markdown("""
 html,body,[class*="css"]{font-family:'Plus Jakarta Sans',system-ui,sans-serif!important;color:#0f2942!important;background:#eaf4f8!important;}
 .stApp{background:#eaf4f8!important;}
 header[data-testid="stHeader"]{background:transparent!important;}
-.stDeployButton,[data-testid="stToolbar"],[data-testid="manage-app-button"],footer{display:none!important;}
-
-/* Force sidebar to always stay visible on desktop when authenticated */
-@media (min-width: 768px) {
-    html:not(:has(.f-login)) [data-testid="stSidebar"] {
-        display: flex !important;
-        transform: none !important;
-        margin-left: 0 !important;
-        visibility: visible !important;
-        opacity: 1 !important;
-        width: 18rem !important;
-        min-width: 18rem !important;
-        position: fixed !important;
-        top: 0 !important;
-        left: 0 !important;
-        bottom: 0 !important;
-        z-index: 99 !important;
-    }
-    html:not(:has(.f-login)) .stMainBlockContainer,
-    html:not(:has(.f-login)) .block-container {
-        margin-left: 18rem !important;
-        max-width: calc(100% - 18rem) !important;
-        padding-top: 20px !important;
-        padding-bottom: 20px !important;
-    }
+.stDeployButton,[data-testid="manage-app-button"],footer{display:none!important;}
+[data-testid="stToolbar"]{
+    visibility:visible!important;
 }
 
+[data-testid="stExpandSidebarButton"]{
+    position:fixed!important;
+    top:18px!important;
+    left:18px!important;
+
+    width:46px!important;
+    height:46px!important;
+
+    background:#0284c7!important;
+    border-radius:12px!important;
+
+    display:flex!important;
+    align-items:center!important;
+    justify-content:center!important;
+
+    visibility:visible!important;
+    opacity:1!important;
+
+    box-shadow:0 4px 12px rgba(0,0,0,0.22)!important;
+
+    z-index:999999!important;
+    pointer-events:auto!important;
+}
+
+[data-testid="stExpandSidebarButton"] button{
+    width:46px!important;
+    height:46px!important;
+
+    background:#0284c7!important;
+    border:none!important;
+    border-radius:12px!important;
+
+    display:flex!important;
+    align-items:center!important;
+    justify-content:center!important;
+
+    cursor:pointer!important;
+}
+
+[data-testid="stExpandSidebarButton"] svg{
+    color:white!important;
+    fill:white!important;
+    width:24px!important;
+    height:24px!important;
+}
+
+[data-testid="stExpandSidebarButton"] button{
+    width:44px!important;
+    height:44px!important;
+    background:#2d9cdb!important;
+    border-radius:10px!important;
+    border:none!important;
+    display:flex!important;
+    align-items:center!important;
+    justify-content:center!important;
+    cursor:pointer!important;
+}
+
+[data-testid="stExpandSidebarButton"] svg{
+    color:white!important;
+    fill:white!important;
+}
+
+
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#07253a 0%,#051b2b 100%)!important;border-right:1px solid rgba(255,255,255,0.06)!important;}
+[data-testid="stSidebarUserContent"]{
+    padding-top:0.5rem!important;
+}
 [data-testid="stSidebar"] *{color:#e2e8f0!important;}
 [data-testid="stSidebarContent"]{padding:0!important;}
 .stSidebar .stButton>button{width:100%!important;background:transparent!important;color:#94a3b8!important;border:none!important;border-radius:10px!important;text-align:left!important;padding:9px 14px!important;font-weight:600!important;font-size:0.88rem!important;margin-bottom:2px!important;transition:all 0.15s!important;}
