@@ -90,8 +90,14 @@ if "authenticated" not in st.session_state:
     }]
 
 st.set_page_config(
-    page_title="BovinoAI Manta - Sanidad Bovina IA",
-    page_icon="🐄", layout="wide", initial_sidebar_state="expanded")
+
+page_title="BovinoAI Manta - Sanidad Bovina IA",
+page_icon="🐄", layout="wide", initial_sidebar_state="expanded")
+
+if "modo_oscuro" not in st.session_state:
+    st.session_state.modo_oscuro = False
+
+modo_oscuro = st.session_state.modo_oscuro
 
 st.markdown("""
 <style>
@@ -499,6 +505,68 @@ with st.sidebar:
         st.session_state.clerk_user = None
         st.rerun()
 
+    st.markdown(
+    "<hr style='border:none;border-top:1px solid rgba(255,255,255,0.07);margin:12px 16px;'>",
+    unsafe_allow_html=True
+)
+
+# ============================================================
+# INTERRUPTOR DE MODO OSCURO
+# ============================================================
+
+nuevo_modo = st.toggle(
+    "🌙 Modo oscuro",
+    value=st.session_state.modo_oscuro,
+    key="toggle_modo"
+)
+
+if nuevo_modo != st.session_state.modo_oscuro:
+    st.session_state.modo_oscuro = nuevo_modo
+    st.rerun()
+
+# ============================================================
+# ESTILOS GLOBALES
+# ============================================================
+
+if st.session_state.modo_oscuro:
+    st.markdown("""
+    <style>
+        .stApp {
+            background-color: #0f172a !important;
+        }
+
+        [data-testid="stSidebar"] {
+            background-color: #020617 !important;
+        }
+
+        .main .block-container {
+            background-color: #0f172a !important;
+        }
+
+        /* Texto del toggle en modo oscuro */
+        [data-testid="stWidgetLabel"] p {
+            color: #ffffff !important;
+        }
+
+        [data-testid="stWidgetLabel"] span {
+            color: #ffffff !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+else:
+    st.markdown("""
+    <style>
+        /* Texto del toggle en modo claro */
+        [data-testid="stWidgetLabel"] p {
+            color: #0f172a !important;
+        }
+
+        [data-testid="stWidgetLabel"] span {
+            color: #0f172a !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
 # ── TOP HEADER ────────────────────────────────────────────────────────────────
 def top_header():
